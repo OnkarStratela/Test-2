@@ -1,11 +1,19 @@
 // rfid_gc_live.c
 // Live-state RFID scanner using two antennas (Source_0 and Source_1).
 //
-// Every sweep (continuous), prints a single line while scanning runs.
+// Both antennas are driven at maximum physical speed: there is NO
+// artificial sleep between sweeps, so each antenna calls
+// CAENRFID_InventoryTag back-to-back as fast as the reader will reply
+// over the serial link. To keep the terminal readable the program
+// prints ONE SUMMARY LINE PER SECOND containing:
+//   - the measured scan rate per antenna in scans/second:  [S0=N/s S1=N/s]
+//   - the most-recent non-empty observation per antenna seen during
+//     that 1-second window (latest RSSI, latest phase, latest EPC).
+//
 // The output uses FIXED SLOTS so tags never shift positions:
 //
-// Empty (no tags in range — shows activity without extra noise):
-//   []
+// Empty (no tags in range during that second — still shows the rate):
+//   [S0=137/s S1=137/s] []
 //
 // Tags visible (slot 0 is always antenna 0, slot 1 is always antenna 1).
 // Per-tag RSSI is printed in brackets right after the antenna number
@@ -13,9 +21,9 @@
 // in degrees (also one decimal), exactly as reported by the reader
 // (no filtering, no arbitration). Empty slots render as pure whitespace
 // so the comma and the other slot never shift columns:
-//   [TX=30 mW] [(0)(-63.1)(p123.4) E2801160600002054E1A1234,   (1)(-65.0)(p210.8) E2801160600002054E1A5678]
-//   [TX=30 mW] [(0)(-63.1)(p123.4) E2801160600002054E1A1234,                                              ]
-//   [TX=30 mW] [                                            ,   (1)(-65.0)(p210.8) E2801160600002054E1A5678]
+//   [TX=30 mW] [S0=137/s S1=137/s] [(0)(-63.1)(p123.4) E2801160600002054E1A1234,   (1)(-65.0)(p210.8) E2801160600002054E1A5678]
+//   [TX=30 mW] [S0=137/s S1=137/s] [(0)(-63.1)(p123.4) E2801160600002054E1A1234,                                              ]
+//   [TX=30 mW] [S0=137/s S1=137/s] [                                            ,   (1)(-65.0)(p210.8) E2801160600002054E1A5678]
 //
 // The reader reports RSSI in tenths of dBm internally (e.g. raw -650
 // == -65.0 dBm); we just divide by 10.0 for display.
@@ -41,6 +49,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h>
 
 #include "CAENRFIDLib_Light.h"
 #include "host.h"
@@ -51,7 +60,7 @@
 #define DEFAULT_POWER_MW    30            // sensible default for ~7 cm read zone
 #define MIN_POWER_MW        1             // reader rejects below its hardware floor
 #define MAX_POWER_MW        316           // R3100C Lepton3 max (25 dBm)
-#define GC_SCAN_MS          100           // ms between scan cycles (= line rate when printing every cycle)
+#define GC_RATE_WINDOW_MS   1000          // print one summary line every N ms (scan rate is reported over this window)
 #define GC_MAX_TAGS         64            // max tags merged across both antennas per sweep
 #define ANTENNA_COUNT       2
 #define MAX_ID_LENGTH       64
@@ -124,23 +133,29 @@ static inline double phase_deg(int16_t raw)
     return ((uint16_t)raw) * 360.0 / PHASE_RAW_FULLSCALE;
 }
 
-// Sweep output:
-//   - bare [] when no antenna saw any tag
-//   - otherwise: [TX=…] [<slot0>,   <slot1>]
-//     Each slot is padded to SLOT_WIDTH. If an antenna missed, its slot
-//     is pure whitespace (no "(N)"), so the comma and the other slot
-//     keep their column positions and nothing shifts.
+// Summary output for one rate-window (default 1 s):
+//   - "[S0=N/s S1=N/s] []" when neither antenna saw any tag during the window
+//   - otherwise: [TX=…] [S0=N/s S1=N/s] [<slot0>,   <slot1>]
+//     Each slot is padded to SLOT_WIDTH. If an antenna missed for the
+//     entire window, its slot is pure whitespace (no "(N)"), so the
+//     comma and the other slot keep their column positions and nothing
+//     shifts. The scans/second figure is measured over the window: it
+//     is the count of CAENRFID_InventoryTag calls per antenna divided
+//     by the elapsed window time.
 static void print_sweep_line(uint32_t power,
                              TagEntry bucket[ANTENNA_COUNT][GC_MAX_TAGS],
-                             const int cnt[ANTENNA_COUNT])
+                             const int cnt[ANTENNA_COUNT],
+                             const int rate[ANTENNA_COUNT])
 {
     if (cnt[0] == 0 && cnt[1] == 0) {
-        printf("[]\n");
+        printf(CYAN "[S0=%d/s S1=%d/s]" RESET " []\n", rate[0], rate[1]);
         fflush(stdout);
         return;
     }
 
-    printf(CYAN "[TX=%u mW]" RESET " [", (unsigned)power);
+    printf(CYAN "[TX=%u mW]" RESET " "
+           CYAN "[S0=%d/s S1=%d/s]" RESET " [",
+           (unsigned)power, rate[0], rate[1]);
 
     for (int ant = 0; ant < ANTENNA_COUNT; ant++) {
         if (ant > 0)
@@ -230,7 +245,8 @@ int main(int argc, char **argv) {
     printf(CYAN "===== Dual-Antenna RFID Live Scanner =====" RESET "\n");
     printf("Port      : %s @ %d baud\n", GC_PORT, GC_BAUDRATE);
     printf("Power     : %u mW (both antennas)\n", power);
-    printf("Cycle     : %d ms\n", GC_SCAN_MS);
+    printf("Scan rate : maximum (no sleep between sweeps)\n");
+    printf("Report    : 1 summary line every %d ms\n", GC_RATE_WINDOW_MS);
     printf("Antennas  : %s, %s\n\n", sources[0], sources[1]);
 
     printf("[GC] Connecting...\n");
@@ -257,17 +273,31 @@ int main(int argc, char **argv) {
                "value may be below the reader's hardware floor.\n",
                power, ec);
     }
-    printf("[GC] Ready. Empty sweeps print []. Tagged sweeps prepend [TX …]. Ctrl+C to stop.\n\n");
+    printf("[GC] Ready. One line per second: [S0=…/s S1=…/s] is the measured\n"
+           "[GC] scan rate per antenna; tagged windows also prepend [TX …]. Ctrl+C to stop.\n\n");
 
     running = 1;
 
-    TagEntry bucket[ANTENNA_COUNT][GC_MAX_TAGS];
-    int      cnt[ANTENNA_COUNT];
+    /* disp_* holds the most-recent non-empty observation per antenna
+       during the current 1-second window. It is what eventually gets
+       printed; we overwrite a slot only when that antenna actually saw
+       tags in a sweep, so a brief miss in the last sweep of the window
+       doesn't erase a tag that was visible 50 ms earlier. */
+    TagEntry disp_bucket[ANTENNA_COUNT][GC_MAX_TAGS];
+    int      disp_cnt[ANTENNA_COUNT] = {0, 0};
+
+    /* scans[ant] counts CAENRFID_InventoryTag calls per antenna inside
+       the current window; we divide by the actual elapsed window time
+       to get the displayed scans/second. */
+    unsigned long scans[ANTENNA_COUNT] = {0, 0};
+
+    struct timespec t_window;
+    clock_gettime(CLOCK_MONOTONIC, &t_window);
 
     while (running) {
 
-        cnt[0] = 0;
-        cnt[1] = 0;
+        TagEntry sweep_bucket[ANTENNA_COUNT][GC_MAX_TAGS];
+        int      sweep_cnt[ANTENNA_COUNT] = {0, 0};
 
         for (int ant = 0; ant < ANTENNA_COUNT && running; ant++) {
             CAENRFIDTagList *tag_list = NULL, *node;
@@ -279,16 +309,21 @@ int main(int argc, char **argv) {
                                        RSSI | PHASE,
                                        &tag_list, &num_tags);
 
+            /* Count every attempted inventory call; this is the figure
+               the user wants to maximise. */
+            scans[ant]++;
+
             if (ec == CAENRFID_StatusOK && num_tags > 0) {
                 node = tag_list;
                 while (node != NULL) {
-                    if (cnt[ant] < GC_MAX_TAGS && cnt[0] + cnt[1] < GC_MAX_TAGS) {
+                    if (sweep_cnt[ant] < GC_MAX_TAGS &&
+                        sweep_cnt[0] + sweep_cnt[1] < GC_MAX_TAGS) {
                         hex_str(node->Tag.ID, node->Tag.Length,
-                                bucket[ant][cnt[ant]].tag);
-                        bucket[ant][cnt[ant]].antenna = ant;
-                        bucket[ant][cnt[ant]].rssi    = node->Tag.RSSI;
-                        bucket[ant][cnt[ant]].phase   = node->Tag.Phase;
-                        cnt[ant]++;
+                                sweep_bucket[ant][sweep_cnt[ant]].tag);
+                        sweep_bucket[ant][sweep_cnt[ant]].antenna = ant;
+                        sweep_bucket[ant][sweep_cnt[ant]].rssi    = node->Tag.RSSI;
+                        sweep_bucket[ant][sweep_cnt[ant]].phase   = node->Tag.Phase;
+                        sweep_cnt[ant]++;
                     }
                     CAENRFIDTagList *next = node->Next;
                     free(node);
@@ -305,9 +340,43 @@ int main(int argc, char **argv) {
             }
         }
 
-        print_sweep_line(power, bucket, cnt);
+        /* Latch the most-recent non-empty result per antenna into the
+           display buffer. We only overwrite a slot when this sweep saw
+           tags on that antenna, so the displayed snapshot reflects the
+           freshest read within the window. */
+        for (int ant = 0; ant < ANTENNA_COUNT; ant++) {
+            if (sweep_cnt[ant] > 0) {
+                for (int i = 0; i < sweep_cnt[ant]; i++)
+                    disp_bucket[ant][i] = sweep_bucket[ant][i];
+                disp_cnt[ant] = sweep_cnt[ant];
+            }
+        }
 
-        usleep(GC_SCAN_MS * 1000);
+        /* Has the rate-window elapsed? If so, compute scans/second
+           per antenna, print the summary, and reset for the next
+           window. No fixed sleep -- the inventory call itself is the
+           only thing pacing the loop, which is exactly what gives us
+           the maximum physical scan rate. */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed_s = (now.tv_sec  - t_window.tv_sec) +
+                           (now.tv_nsec - t_window.tv_nsec) / 1e9;
+
+        if (elapsed_s * 1000.0 >= (double)GC_RATE_WINDOW_MS) {
+            int rate[ANTENNA_COUNT];
+            for (int ant = 0; ant < ANTENNA_COUNT; ant++)
+                rate[ant] = (elapsed_s > 0.0)
+                    ? (int)((double)scans[ant] / elapsed_s + 0.5)
+                    : 0;
+
+            print_sweep_line(power, disp_bucket, disp_cnt, rate);
+
+            scans[0] = 0;
+            scans[1] = 0;
+            disp_cnt[0] = 0;
+            disp_cnt[1] = 0;
+            t_window = now;
+        }
     }
 
     CAENRFID_Disconnect(&reader);
