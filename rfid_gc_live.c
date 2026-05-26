@@ -1,39 +1,56 @@
 // rfid_gc_live.c
-// Live-state RFID scanner using two antennas (Source_0 and Source_1).
+// Dual-antenna RFID live scanner with strict antenna attribution.
 //
-// Both antennas are driven at maximum physical speed: there is NO
-// artificial sleep between sweeps, so each antenna calls
-// CAENRFID_InventoryTag back-to-back as fast as the reader will reply
-// over the serial link. To keep the terminal readable the program
-// prints ONE SUMMARY LINE PER SECOND containing:
-//   - the measured scan rate per antenna in scans/second:  [S0=N/s S1=N/s]
-//   - the most-recent non-empty observation per antenna seen during
-//     that 1-second window (latest RSSI, latest phase, latest EPC).
+// Physical setup (the one this arbitrator was tuned for):
+//   - Two CAEN R3100C Lepton3 antennas mounted horizontally, 150 mm
+//     centre-to-centre. A tag is "placed over" one antenna when it sits
+//     roughly above its centre (~5-7 cm from that antenna's face). The
+//     opposite antenna is then ~15 cm away, so its received signal for
+//     the same tag should be ~9-15 dB weaker than the home antenna
+//     (free-space path-loss only; reality usually adds more attenuation
+//     from antenna pattern roll-off and the dielectric of the housing).
 //
-// The output uses FIXED SLOTS so tags never shift positions:
+// Goal: over every 2-second window decide *which* antenna actually
+// owns each EPC, with ZERO cross-reads. A tag sitting over antenna A
+// must NEVER show up in antenna B's slot, even when antenna B picks
+// up a faint leakage read of the same tag.
 //
-// Empty (no tags in range during that second — still shows the rate):
+// How: we drive both antennas serially at maximum physical speed (no
+// sleep between sweeps, exactly as before). For every read returned by
+// CAENRFID_InventoryTag we update a per-EPC stats table that tracks,
+// per antenna, the read count and the maximum RSSI seen during the
+// window. When the 2-second window closes we run an arbitration pass
+// that promotes a tag onto an antenna's slot ONLY if that antenna is
+// dominant in both signal strength AND read count.
+//
+// Arbitration rule (applied once per EPC at end of each window):
+//   - The "winner" is the antenna with the larger max RSSI.
+//   - If the winner's max RSSI is below GC_RSSI_FLOOR_DBM10, the tag
+//     is treated as leakage and dropped entirely.
+//   - If the winner's read count is below GC_MIN_READS, dropped.
+//   - If only the winner saw the tag during the window: attribute it.
+//   - If both antennas saw the tag, additionally require BOTH:
+//       max_rssi[winner] - max_rssi[loser] >= GC_RSSI_MARGIN_DB10
+//       count[winner] >= GC_COUNT_DOMINANCE * count[loser]
+//     If either condition fails -> ambiguous, drop the tag entirely.
+//
+// The reader is asked for RSSI only (no PHASE). The displayed RSSI is
+// the maximum value seen by the winning antenna across the window
+// (closest to 0 dBm = strongest read = most confident attribution).
+// The reader reports RSSI in tenths of dBm; we divide by 10.0 for
+// display.
+//
+// Output (identical to previous version minus the phase column):
+//
+// Empty (no tag was decisively attributed during the 2 s window):
 //   [S0=137/s S1=137/s] []
 //
-// Tags visible (slot 0 is always antenna 0, slot 1 is always antenna 1).
-// Per-tag RSSI is printed in brackets right after the antenna number
-// in real dBm (one decimal place), followed by the backscatter PHASE
-// in degrees (also one decimal), exactly as reported by the reader
-// (no filtering, no arbitration). Empty slots render as pure whitespace
-// so the comma and the other slot never shift columns:
-//   [TX=30 mW] [S0=137/s S1=137/s] [(0)(-63.1)(p123.4) E2801160600002054E1A1234,   (1)(-65.0)(p210.8) E2801160600002054E1A5678]
-//   [TX=30 mW] [S0=137/s S1=137/s] [(0)(-63.1)(p123.4) E2801160600002054E1A1234,                                              ]
-//   [TX=30 mW] [S0=137/s S1=137/s] [                                            ,   (1)(-65.0)(p210.8) E2801160600002054E1A5678]
-//
-// The reader reports RSSI in tenths of dBm internally (e.g. raw -650
-// == -65.0 dBm); we just divide by 10.0 for display.
-//
-// Phase: the CAEN easy2read protocol returns AVP_PHASE as a 16-bit value
-// from the Impinj E310 radio (R3100C Lepton3). On Impinj chips that
-// value is a 12-bit unsigned phase angle (0..4095 ↔ 0..360°), so we
-// display raw * 360.0 / 4096.0. Unwrapped phase is what tells you the
-// fine-grained tag distance (Δd = λ·Δφ / (4π)); λ ≈ 32.8 cm at 915 MHz
-// means one full 360° wrap ≈ 16.4 cm of round-trip motion.
+// With attribution -- slot 0 is always antenna 0, slot 1 is always
+// antenna 1, and empty slots render as pure whitespace so the comma
+// and the other slot never shift columns:
+//   [TX=30 mW] [S0=137/s S1=137/s] [(0)(-58.3) E2801160600002054E1A1234,   (1)(-61.7) E2801160600002054E1A5678]
+//   [TX=30 mW] [S0=137/s S1=137/s] [(0)(-58.3) E2801160600002054E1A1234,                                      ]
+//   [TX=30 mW] [S0=137/s S1=137/s] [                                    ,   (1)(-61.7) E2801160600002054E1A5678]
 //
 // Antenna index in YELLOW; Src0 tag EPC in GREEN, Src1 tag EPC in RED.
 //
@@ -60,10 +77,20 @@
 #define DEFAULT_POWER_MW    30            // sensible default for ~7 cm read zone
 #define MIN_POWER_MW        1             // reader rejects below its hardware floor
 #define MAX_POWER_MW        316           // R3100C Lepton3 max (25 dBm)
-#define GC_RATE_WINDOW_MS   1000          // print one summary line every N ms (scan rate is reported over this window)
-#define GC_MAX_TAGS         64            // max tags merged across both antennas per sweep
+#define GC_RATE_WINDOW_MS   2000          // decision/arbitration window (also the print cadence)
+#define GC_MAX_TAGS         64            // max distinct EPCs tracked per window
 #define ANTENNA_COUNT       2
 #define MAX_ID_LENGTH       64
+
+// Arbitration thresholds (tune for your physical layout).
+//
+// RSSI values from the reader are in tenths of dBm: -631 -> -63.1 dBm.
+// All four thresholds are deliberately conservative -- when in doubt we
+// drop the tag (= zero cross-reads), which is the explicit design goal.
+#define GC_RSSI_FLOOR_DBM10  (-700)  // -70.0 dBm: reads weaker than this are treated as leakage
+#define GC_RSSI_MARGIN_DB10  ( 60)   //   6.0 dB: winner must beat loser by this much max RSSI
+#define GC_COUNT_DOMINANCE   ( 2)    //   winner's read count must be >= this * loser's read count
+#define GC_MIN_READS         ( 3)    //   ignore EPCs with fewer reads than this on the winning antenna
 
 // ANSI colours
 #define GREEN  "\033[0;32m"
@@ -74,12 +101,21 @@
 
 volatile int running = 0;
 
+// One entry to display in a slot after arbitration.
 typedef struct {
     char    tag[2 * MAX_ID_LENGTH + 1];
     int     antenna;
     int16_t rssi;        /* tenths of dBm, as reported by the reader */
-    int16_t phase;       /* raw AVP_PHASE value (12-bit on Impinj E310) */
 } TagEntry;
+
+// Per-EPC statistics accumulated across one decision window.
+// max_rssi[ant] is the strongest RSSI seen by `ant` during the window
+// (larger = closer to 0 dBm = stronger); INT16_MIN means "not seen".
+typedef struct {
+    char     epc[2 * MAX_ID_LENGTH + 1];
+    unsigned count[ANTENNA_COUNT];
+    int16_t  max_rssi[ANTENNA_COUNT];
+} TagStats;
 
 static void hex_str(uint8_t *bytes, uint16_t len, char *out) {
     for (int i = 0; i < len; i++)
@@ -116,32 +152,63 @@ static void handle_sigint(int sig) {
 
 // Width (visible chars, ignoring ANSI colour codes) reserved for each
 // antenna slot inside the brackets. Comfortably fits
-// "(N)(-XXX.X)(pYYY.Y) " + a 24-char EPC-96 hex string; longer tags
-// overflow without truncation.
-#define SLOT_WIDTH 46
+// "(N)(-XXX.X) " + a 24-char EPC-96 hex string.
+#define SLOT_WIDTH 38
 
-// Convert the reader's raw 16-bit AVP_PHASE value into degrees.
-// The R3100C Lepton3 is built on the Impinj E310 radio, whose phase
-// register is 12-bit unsigned: 0..4095 maps linearly to 0..360°. If
-// you ever swap to a reader that returns phase in a different scale
-// (e.g. centidegrees), just change this single constant.
-#define PHASE_RAW_FULLSCALE 4096.0
-static inline double phase_deg(int16_t raw)
+// Returns the index of the entry for `epc` in `stats`, inserting a
+// new entry (with max_rssi initialised to INT16_MIN) if needed.
+// Returns -1 if the table is already full.
+static int stats_find_or_insert(TagStats *stats, int *count, const char *epc)
 {
-    /* AVP_PHASE is read as a uint16_t; the cast keeps it non-negative
-       even though the struct field is int16_t for legacy reasons. */
-    return ((uint16_t)raw) * 360.0 / PHASE_RAW_FULLSCALE;
+    for (int i = 0; i < *count; i++) {
+        if (strcmp(stats[i].epc, epc) == 0) return i;
+    }
+    if (*count >= GC_MAX_TAGS) return -1;
+    int idx = (*count)++;
+    memset(&stats[idx], 0, sizeof stats[idx]);
+    strncpy(stats[idx].epc, epc, sizeof stats[idx].epc - 1);
+    stats[idx].epc[sizeof stats[idx].epc - 1] = '\0';
+    stats[idx].max_rssi[0] = INT16_MIN;
+    stats[idx].max_rssi[1] = INT16_MIN;
+    return idx;
 }
 
-// Summary output for one rate-window (default 1 s):
-//   - "[S0=N/s S1=N/s] []" when neither antenna saw any tag during the window
+// Apply the arbitration rule and return the winning antenna index
+// (0 or 1), or -1 if the tag is ambiguous / leakage and should NOT
+// be displayed. See the file header for the rule definition.
+static int stats_arbitrate(const TagStats *s)
+{
+    int winner, loser;
+    if (s->max_rssi[0] >= s->max_rssi[1]) { winner = 0; loser = 1; }
+    else                                  { winner = 1; loser = 0; }
+
+    /* Need a real, strong observation on the winning antenna. */
+    if (s->count[winner] < (unsigned)GC_MIN_READS)            return -1;
+    if (s->max_rssi[winner] < GC_RSSI_FLOOR_DBM10)            return -1;
+
+    /* Only the winner saw it -> clean attribution. */
+    if (s->count[loser] == 0) return winner;
+
+    /* Both antennas saw it -> require dominance in BOTH axes. If
+       either margin is missed we drop the tag entirely, which is the
+       "zero cross-read" guarantee. */
+    int16_t margin = s->max_rssi[winner] - s->max_rssi[loser];
+    if (margin < GC_RSSI_MARGIN_DB10)                         return -1;
+    if (s->count[winner] < (unsigned)GC_COUNT_DOMINANCE * s->count[loser])
+        return -1;
+
+    return winner;
+}
+
+// Summary output for one decision window:
+//   - "[S0=N/s S1=N/s] []" when arbitration attributed nothing
 //   - otherwise: [TX=…] [S0=N/s S1=N/s] [<slot0>,   <slot1>]
-//     Each slot is padded to SLOT_WIDTH. If an antenna missed for the
-//     entire window, its slot is pure whitespace (no "(N)"), so the
-//     comma and the other slot keep their column positions and nothing
-//     shifts. The scans/second figure is measured over the window: it
-//     is the count of CAENRFID_InventoryTag calls per antenna divided
-//     by the elapsed window time.
+//     Each slot is padded to SLOT_WIDTH. If an antenna won no tags in
+//     the window, its slot is pure whitespace (no "(N)"), so the comma
+//     and the other slot keep their column positions and nothing shifts.
+//     The scans/second figure is measured over the window: it is the
+//     count of CAENRFID_InventoryTag calls per antenna divided by the
+//     elapsed window time.
 static void print_sweep_line(uint32_t power,
                              TagEntry bucket[ANTENNA_COUNT][GC_MAX_TAGS],
                              const int cnt[ANTENNA_COUNT],
@@ -166,18 +233,17 @@ static void print_sweep_line(uint32_t power,
             continue;
         }
 
-        /* Visible width of the slot content (excludes ANSI codes) so we
-           can right-pad to SLOT_WIDTH and keep the ']' column stable.
-           Reader RSSI is in tenths of dBm, so we display it as a real
-           dBm value with one decimal (e.g. raw -631 -> "-63.1"). The
-           Phase is decoded into degrees with one decimal as well. */
+        /* Visible width of the slot content (excludes ANSI codes) so
+           we can right-pad to SLOT_WIDTH and keep the ']' column
+           stable. The displayed RSSI is the max RSSI seen by the
+           winning antenna during the window, in real dBm with one
+           decimal place (e.g. raw -583 -> "-58.3"). */
         int visible = 3; /* "(N)" */
         for (int i = 0; i < cnt[ant]; i++) {
             char rbuf[24];
             int rlen = snprintf(rbuf, sizeof rbuf,
-                                "(%.1f)(p%.1f) ",
-                                bucket[ant][i].rssi / 10.0,
-                                phase_deg(bucket[ant][i].phase));
+                                "(%.1f) ",
+                                bucket[ant][i].rssi / 10.0);
             if (i > 0) visible += 1; /* space between multiple tags */
             visible += rlen + (int)strlen(bucket[ant][i].tag);
         }
@@ -186,9 +252,8 @@ static void print_sweep_line(uint32_t power,
         printf(YELLOW "(%d)" RESET, ant);
         for (int i = 0; i < cnt[ant]; i++) {
             if (i > 0) printf(" ");
-            printf("(%.1f)(p%.1f) %s%s" RESET,
+            printf("(%.1f) %s%s" RESET,
                    bucket[ant][i].rssi / 10.0,
-                   phase_deg(bucket[ant][i].phase),
                    tagcol, bucket[ant][i].tag);
         }
         int pad = SLOT_WIDTH - visible;
@@ -242,12 +307,17 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, handle_sigint);
 
-    printf(CYAN "===== Dual-Antenna RFID Live Scanner =====" RESET "\n");
+    printf(CYAN "===== Dual-Antenna RFID Live Scanner (arbitrated) =====" RESET "\n");
     printf("Port      : %s @ %d baud\n", GC_PORT, GC_BAUDRATE);
     printf("Power     : %u mW (both antennas)\n", power);
     printf("Scan rate : maximum (no sleep between sweeps)\n");
-    printf("Report    : 1 summary line every %d ms\n", GC_RATE_WINDOW_MS);
-    printf("Antennas  : %s, %s\n\n", sources[0], sources[1]);
+    printf("Decision  : 1 attribution + 1 summary line every %d ms\n", GC_RATE_WINDOW_MS);
+    printf("Antennas  : %s, %s  (150 mm centre-to-centre)\n", sources[0], sources[1]);
+    printf("Arbitration: floor=%.1f dBm, margin=%.1f dB, count>=%dx, min reads=%d\n\n",
+           GC_RSSI_FLOOR_DBM10 / 10.0,
+           GC_RSSI_MARGIN_DB10 / 10.0,
+           GC_COUNT_DOMINANCE,
+           GC_MIN_READS);
 
     printf("[GC] Connecting...\n");
     ec = CAENRFID_Connect(&reader, CAENRFID_RS232, &port_params);
@@ -273,18 +343,15 @@ int main(int argc, char **argv) {
                "value may be below the reader's hardware floor.\n",
                power, ec);
     }
-    printf("[GC] Ready. One line per second: [S0=…/s S1=…/s] is the measured\n"
-           "[GC] scan rate per antenna; tagged windows also prepend [TX …]. Ctrl+C to stop.\n\n");
+    printf("[GC] Ready. One line every 2 s: arbitrated [(0) tag, (1) tag];\n"
+           "[GC] [S0=…/s S1=…/s] is the measured scan rate per antenna. Ctrl+C to stop.\n\n");
 
     running = 1;
 
-    /* disp_* holds the most-recent non-empty observation per antenna
-       during the current 1-second window. It is what eventually gets
-       printed; we overwrite a slot only when that antenna actually saw
-       tags in a sweep, so a brief miss in the last sweep of the window
-       doesn't erase a tag that was visible 50 ms earlier. */
-    TagEntry disp_bucket[ANTENNA_COUNT][GC_MAX_TAGS];
-    int      disp_cnt[ANTENNA_COUNT] = {0, 0};
+    /* Per-EPC statistics, accumulated across the entire decision window.
+       Reset at the end of every window. */
+    TagStats stats[GC_MAX_TAGS];
+    int      stats_count = 0;
 
     /* scans[ant] counts CAENRFID_InventoryTag calls per antenna inside
        the current window; we divide by the actual elapsed window time
@@ -296,9 +363,6 @@ int main(int argc, char **argv) {
 
     while (running) {
 
-        TagEntry sweep_bucket[ANTENNA_COUNT][GC_MAX_TAGS];
-        int      sweep_cnt[ANTENNA_COUNT] = {0, 0};
-
         for (int ant = 0; ant < ANTENNA_COUNT && running; ant++) {
             CAENRFIDTagList *tag_list = NULL, *node;
             uint16_t num_tags = 0;
@@ -306,63 +370,60 @@ int main(int argc, char **argv) {
             ec = CAENRFID_InventoryTag(&reader, (char *)sources[ant],
                                        0, 0, 0,
                                        NULL, 0,
-                                       RSSI | PHASE,
+                                       RSSI,
                                        &tag_list, &num_tags);
 
             /* Count every attempted inventory call; this is the figure
-               the user wants to maximise. */
+               we report as scans/s/antenna. */
             scans[ant]++;
 
-            if (ec == CAENRFID_StatusOK && num_tags > 0) {
-                node = tag_list;
-                while (node != NULL) {
-                    if (sweep_cnt[ant] < GC_MAX_TAGS &&
-                        sweep_cnt[0] + sweep_cnt[1] < GC_MAX_TAGS) {
-                        hex_str(node->Tag.ID, node->Tag.Length,
-                                sweep_bucket[ant][sweep_cnt[ant]].tag);
-                        sweep_bucket[ant][sweep_cnt[ant]].antenna = ant;
-                        sweep_bucket[ant][sweep_cnt[ant]].rssi    = node->Tag.RSSI;
-                        sweep_bucket[ant][sweep_cnt[ant]].phase   = node->Tag.Phase;
-                        sweep_cnt[ant]++;
+            /* Walk the linked list returned by the reader. We always
+               free every node; we only fold reads into `stats` when
+               the inventory call actually succeeded with tags. */
+            node = tag_list;
+            while (node != NULL) {
+                if (ec == CAENRFID_StatusOK && num_tags > 0) {
+                    char epc[2 * MAX_ID_LENGTH + 1];
+                    hex_str(node->Tag.ID, node->Tag.Length, epc);
+                    int idx = stats_find_or_insert(stats, &stats_count, epc);
+                    if (idx >= 0) {
+                        stats[idx].count[ant]++;
+                        if (node->Tag.RSSI > stats[idx].max_rssi[ant])
+                            stats[idx].max_rssi[ant] = node->Tag.RSSI;
                     }
-                    CAENRFIDTagList *next = node->Next;
-                    free(node);
-                    node = next;
                 }
-            } else {
-                // Free list if returned with non-OK code
-                node = tag_list;
-                while (node != NULL) {
-                    CAENRFIDTagList *next = node->Next;
-                    free(node);
-                    node = next;
-                }
+                CAENRFIDTagList *next = node->Next;
+                free(node);
+                node = next;
             }
         }
 
-        /* Latch the most-recent non-empty result per antenna into the
-           display buffer. We only overwrite a slot when this sweep saw
-           tags on that antenna, so the displayed snapshot reflects the
-           freshest read within the window. */
-        for (int ant = 0; ant < ANTENNA_COUNT; ant++) {
-            if (sweep_cnt[ant] > 0) {
-                for (int i = 0; i < sweep_cnt[ant]; i++)
-                    disp_bucket[ant][i] = sweep_bucket[ant][i];
-                disp_cnt[ant] = sweep_cnt[ant];
-            }
-        }
-
-        /* Has the rate-window elapsed? If so, compute scans/second
-           per antenna, print the summary, and reset for the next
-           window. No fixed sleep -- the inventory call itself is the
-           only thing pacing the loop, which is exactly what gives us
-           the maximum physical scan rate. */
+        /* Has the decision window elapsed? If so, run arbitration on
+           every EPC seen during the window, build the display buffer
+           with only the unambiguous attributions, print one summary
+           line, and reset for the next window. No fixed sleep -- the
+           inventory call itself is the only thing pacing the loop. */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         double elapsed_s = (now.tv_sec  - t_window.tv_sec) +
                            (now.tv_nsec - t_window.tv_nsec) / 1e9;
 
         if (elapsed_s * 1000.0 >= (double)GC_RATE_WINDOW_MS) {
+            TagEntry disp_bucket[ANTENNA_COUNT][GC_MAX_TAGS];
+            int      disp_cnt[ANTENNA_COUNT] = {0, 0};
+
+            for (int i = 0; i < stats_count; i++) {
+                int winner = stats_arbitrate(&stats[i]);
+                if (winner < 0) continue;
+                if (disp_cnt[winner] >= GC_MAX_TAGS) continue;
+
+                TagEntry *e = &disp_bucket[winner][disp_cnt[winner]++];
+                strncpy(e->tag, stats[i].epc, sizeof e->tag - 1);
+                e->tag[sizeof e->tag - 1] = '\0';
+                e->antenna = winner;
+                e->rssi    = stats[i].max_rssi[winner];
+            }
+
             int rate[ANTENNA_COUNT];
             for (int ant = 0; ant < ANTENNA_COUNT; ant++)
                 rate[ant] = (elapsed_s > 0.0)
@@ -373,8 +434,7 @@ int main(int argc, char **argv) {
 
             scans[0] = 0;
             scans[1] = 0;
-            disp_cnt[0] = 0;
-            disp_cnt[1] = 0;
+            stats_count = 0;
             t_window = now;
         }
     }
