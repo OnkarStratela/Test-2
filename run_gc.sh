@@ -10,5 +10,5 @@ chmod +x compile_gc.sh
 ./compile_gc.sh
 
 if [ $? -eq 0 ]; then
-    ./rfid_gc_live
+    ./rfid_gc_live "$@"
 fi
