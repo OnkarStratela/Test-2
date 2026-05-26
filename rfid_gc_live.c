@@ -77,7 +77,7 @@
 #define DEFAULT_POWER_MW    30            // sensible default for ~7 cm read zone
 #define MIN_POWER_MW        1             // reader rejects below its hardware floor
 #define MAX_POWER_MW        316           // R3100C Lepton3 max (25 dBm)
-#define GC_RATE_WINDOW_MS   2000          // decision/arbitration window (also the print cadence)
+#define GC_RATE_WINDOW_MS   1000          // decision/arbitration window (also the print cadence)
 #define GC_MAX_TAGS         64            // max distinct EPCs tracked per window
 #define ANTENNA_COUNT       2
 #define MAX_ID_LENGTH       64
@@ -343,8 +343,9 @@ int main(int argc, char **argv) {
                "value may be below the reader's hardware floor.\n",
                power, ec);
     }
-    printf("[GC] Ready. One line every 2 s: arbitrated [(0) tag, (1) tag];\n"
-           "[GC] [S0=…/s S1=…/s] is the measured scan rate per antenna. Ctrl+C to stop.\n\n");
+    printf("[GC] Ready. One line every %.1f s: arbitrated [(0) tag, (1) tag];\n"
+           "[GC] [S0=…/s S1=…/s] is the measured scan rate per antenna. Ctrl+C to stop.\n\n",
+           GC_RATE_WINDOW_MS / 1000.0);
 
     running = 1;
 
