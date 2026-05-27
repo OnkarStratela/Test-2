@@ -62,20 +62,24 @@
 // Test-harness extensions (all optional, fully backwards compatible):
 //   ./rfid_gc_live 30 --duration 3         exit after 3 s instead of Ctrl+C
 //   ./rfid_gc_live 30 --window-ms 250      override the 1000 ms decision window
-//   ./rfid_gc_live 30 --csv trial.csv      write one row per decision window
-//                                          (header + dropped/leakage counters)
-//   ./rfid_gc_live 30 --quiet              suppress colour stdout (CSV only)
 //
-// CSV schema (one row per decision window):
-//   window_idx, t_start_unix, t_end_unix, power_mw, window_ms,
-//   scans_0, scans_1, rate_0_hz, rate_1_hz,
-//   attr_ant0_epc, attr_ant0_max_rssi_dbm,
-//   attr_ant1_epc, attr_ant1_max_rssi_dbm,
-//   n_unique_epcs, n_dropped_below_floor,
-//   n_dropped_low_count, n_dropped_ambiguous
+// Stdout protocol consumed by test_logger.py:
 //
-// Multiple attributed tags on one antenna in the same window are
-// semicolon-separated within the EPC/RSSI columns.
+// At the end of every decision window the binary emits one machine-
+// readable line in addition to the original human-readable colour line:
+//
+//   [GC_WIN] win=N t_start=UNIX_FLOAT t_end=UNIX_FLOAT power_mw=N
+//           win_ms=FLOAT scans_0=N scans_1=N rate_0=FLOAT rate_1=FLOAT
+//           ant0_epc=EPC|EPC|... ant0_rssi=DBM|DBM|...
+//           ant1_epc=EPC|EPC|... ant1_rssi=DBM|DBM|...
+//           unique=N drop_floor=N drop_low=N drop_amb=N
+//
+// All values are `key=value` pairs separated by single spaces, no value
+// contains whitespace. Empty slots use the literal "-" (so the line is
+// always parseable with a single regex). Multiple tags attributed to
+// the same antenna in one window are pipe-separated within the EPC
+// and RSSI fields. The pretty colour line is printed first for the
+// human at the terminal; test_logger.py ignores it.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -121,13 +125,11 @@
 
 volatile int running = 0;
 
-// Test-harness state. All set once in main() and read everywhere else.
-// They control test/CSV behaviour without affecting the original on-screen
-// experience when no flags are passed.
-static bool     g_quiet               = false;          // suppress colour stdout
+// Test-harness state, set once in main(). Both flags default to "no
+// change" so an invocation without any flags behaves exactly like the
+// original interactive scanner.
 static double   g_duration_s          = 0.0;            // 0 = run until Ctrl+C
 static uint32_t g_decision_window_ms  = GC_RATE_WINDOW_MS;
-static FILE    *g_csv                 = NULL;
 
 // Arbitration outcome categories. Used to populate per-window drop
 // counters so the test harness can distinguish "tag is missed" from
@@ -164,7 +166,7 @@ static void hex_str(uint8_t *bytes, uint16_t len, char *out) {
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
-        "  %s [<mW>] [--duration <sec>] [--window-ms <ms>] [--csv <file>] [--quiet]\n"
+        "  %s [<mW>] [--duration <sec>] [--window-ms <ms>]\n"
         "\n"
         "Positional:\n"
         "  <mW>               TX power in mW (range %d..%d, default %d)\n"
@@ -172,8 +174,6 @@ static void usage(const char *prog) {
         "Options:\n"
         "  --duration <sec>   Stop automatically after <sec> seconds (float; 0 = run forever)\n"
         "  --window-ms <ms>   Decision-window length in ms (default %d, range %d..%d)\n"
-        "  --csv <file>       Write one CSV row per decision window to <file>\n"
-        "  --quiet            Suppress colour stdout (errors still printed)\n"
         "  -h | --help        Show this message\n",
         prog, MIN_POWER_MW, MAX_POWER_MW, DEFAULT_POWER_MW,
         GC_RATE_WINDOW_MS, GC_MIN_WINDOW_MS, GC_MAX_WINDOW_MS);
@@ -222,9 +222,7 @@ static bool parse_u32_range(const char *s, uint32_t lo, uint32_t hi, uint32_t *o
 static int parse_args(int argc, char **argv,
                       uint32_t *power,
                       double *duration_s,
-                      uint32_t *window_ms,
-                      const char **csv_path,
-                      bool *quiet)
+                      uint32_t *window_ms)
 {
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -244,15 +242,6 @@ static int parse_args(int argc, char **argv,
                 usage(argv[0]);
                 return -1;
             }
-            continue;
-        }
-        if (strcmp(a, "--csv") == 0) {
-            if (i + 1 >= argc) { usage(argv[0]); return -1; }
-            *csv_path = argv[++i];
-            continue;
-        }
-        if (strcmp(a, "--quiet") == 0) {
-            *quiet = true;
             continue;
         }
         if (a[0] != '-') {
@@ -338,70 +327,67 @@ static int stats_arbitrate(const TagStats *s, ArbResult *reason)
     return winner;
 }
 
-// Write the CSV header. Schema is fixed; the Python harness depends on
-// it 1:1. Multiple tags attributed to the same antenna in a single
-// window are emitted as semicolon-separated lists in the EPC and RSSI
-// columns.
-static void csv_write_header(FILE *f)
-{
-    if (!f) return;
-    fputs("window_idx,t_start_unix,t_end_unix,power_mw,window_ms,"
-          "scans_0,scans_1,rate_0_hz,rate_1_hz,"
-          "attr_ant0_epc,attr_ant0_max_rssi_dbm,"
-          "attr_ant1_epc,attr_ant1_max_rssi_dbm,"
-          "n_unique_epcs,n_dropped_below_floor,"
-          "n_dropped_low_count,n_dropped_ambiguous\n", f);
-    fflush(f);
-}
-
-// Write one CSV row for the just-closed decision window.
-static void csv_write_window(FILE *f,
-                             unsigned window_idx,
-                             double t_start_unix,
-                             double t_end_unix,
-                             uint32_t power,
-                             double window_ms_actual,
-                             unsigned long scans_0,
-                             unsigned long scans_1,
-                             double rate_0_hz, double rate_1_hz,
-                             TagEntry bucket[ANTENNA_COUNT][GC_MAX_TAGS],
-                             const int cnt[ANTENNA_COUNT],
-                             unsigned unique_epcs,
-                             unsigned dropped_floor,
-                             unsigned dropped_count,
-                             unsigned dropped_ambig)
-{
-    if (!f) return;
-
-    fprintf(f, "%u,%.6f,%.6f,%u,%.3f,%lu,%lu,%.2f,%.2f,",
-            window_idx, t_start_unix, t_end_unix, power,
-            window_ms_actual, scans_0, scans_1, rate_0_hz, rate_1_hz);
-
-    for (int ant = 0; ant < ANTENNA_COUNT; ant++) {
-        for (int i = 0; i < cnt[ant]; i++) {
-            if (i > 0) fputc(';', f);
-            fputs(bucket[ant][i].tag, f);
-        }
-        fputc(',', f);
-        for (int i = 0; i < cnt[ant]; i++) {
-            if (i > 0) fputc(';', f);
-            fprintf(f, "%.1f", bucket[ant][i].rssi / 10.0);
-        }
-        fputc(',', f);
-    }
-
-    fprintf(f, "%u,%u,%u,%u\n",
-            unique_epcs, dropped_floor, dropped_count, dropped_ambig);
-    fflush(f);
-}
-
-// Wall-clock seconds since the Unix epoch as a double. Used for CSV
-// timestamps so trials can be aligned across machines / log files.
+// Wall-clock seconds since the Unix epoch as a double. Used for the
+// per-window timestamps so trials can be aligned across machines and
+// log files. We never use this for the inter-window pacing itself;
+// that's still CLOCK_MONOTONIC, immune to NTP slew.
 static double now_unix(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+// Emit ONE machine-readable line per decision window for the test
+// harness. Format documented at the top of this file. Empty antenna
+// slots use the literal "-" so the line is always parseable with a
+// single key=value regex; multiple attributed tags on one antenna
+// are pipe-separated within ant<i>_epc and ant<i>_rssi.
+static void print_window_line(unsigned window_idx,
+                              double t_start_unix,
+                              double t_end_unix,
+                              uint32_t power,
+                              double window_ms_actual,
+                              unsigned long scans_0,
+                              unsigned long scans_1,
+                              double rate_0_hz, double rate_1_hz,
+                              TagEntry bucket[ANTENNA_COUNT][GC_MAX_TAGS],
+                              const int cnt[ANTENNA_COUNT],
+                              unsigned unique_epcs,
+                              unsigned dropped_floor,
+                              unsigned dropped_count,
+                              unsigned dropped_ambig)
+{
+    printf("[GC_WIN] win=%u t_start=%.6f t_end=%.6f power_mw=%u "
+           "win_ms=%.3f scans_0=%lu scans_1=%lu rate_0=%.2f rate_1=%.2f ",
+           window_idx, t_start_unix, t_end_unix, power,
+           window_ms_actual, scans_0, scans_1, rate_0_hz, rate_1_hz);
+
+    for (int ant = 0; ant < ANTENNA_COUNT; ant++) {
+        printf("ant%d_epc=", ant);
+        if (cnt[ant] == 0) {
+            fputs("-", stdout);
+        } else {
+            for (int i = 0; i < cnt[ant]; i++) {
+                if (i > 0) fputc('|', stdout);
+                fputs(bucket[ant][i].tag, stdout);
+            }
+        }
+        printf(" ant%d_rssi=", ant);
+        if (cnt[ant] == 0) {
+            fputs("-", stdout);
+        } else {
+            for (int i = 0; i < cnt[ant]; i++) {
+                if (i > 0) fputc('|', stdout);
+                printf("%.1f", bucket[ant][i].rssi / 10.0);
+            }
+        }
+        fputc(' ', stdout);
+    }
+
+    printf("unique=%u drop_floor=%u drop_low=%u drop_amb=%u\n",
+           unique_epcs, dropped_floor, dropped_count, dropped_ambig);
+    fflush(stdout);
 }
 
 // Summary output for one decision window:
@@ -469,24 +455,12 @@ static void print_sweep_line(uint32_t power,
 
 int main(int argc, char **argv) {
 
-    uint32_t power      = DEFAULT_POWER_MW;
-    const char *csv_path = NULL;
+    uint32_t power = DEFAULT_POWER_MW;
 
     int pa = parse_args(argc, argv, &power,
-                        &g_duration_s, &g_decision_window_ms,
-                        &csv_path, &g_quiet);
+                        &g_duration_s, &g_decision_window_ms);
     if (pa == 1)      return 0;   /* --help printed */
     else if (pa < 0)  return 1;   /* parse error printed */
-
-    if (csv_path != NULL) {
-        g_csv = fopen(csv_path, "w");
-        if (g_csv == NULL) {
-            fprintf(stderr, "[GC] ERROR: cannot open CSV file '%s' for writing.\n",
-                    csv_path);
-            return 1;
-        }
-        csv_write_header(g_csv);
-    }
 
     CAENRFIDErrorCodes ec;
     CAENRFIDReader reader = {
@@ -514,26 +488,22 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, handle_sigint);
 
-    if (!g_quiet) {
-        printf(CYAN "===== Dual-Antenna RFID Live Scanner (arbitrated) =====" RESET "\n");
-        printf("Port      : %s @ %d baud\n", GC_PORT, GC_BAUDRATE);
-        printf("Power     : %u mW (both antennas)\n", power);
-        printf("Scan rate : maximum (no sleep between sweeps)\n");
-        printf("Decision  : 1 attribution + 1 summary line every %u ms\n", g_decision_window_ms);
-        if (g_duration_s > 0.0)
-            printf("Duration  : %.3f s then auto-stop\n", g_duration_s);
-        else
-            printf("Duration  : until Ctrl+C\n");
-        if (csv_path != NULL)
-            printf("CSV       : %s\n", csv_path);
-        printf("Antennas  : %s, %s  (150 mm centre-to-centre)\n", sources[0], sources[1]);
-        printf("Arbitration: floor=%.1f dBm, margin=%.1f dB, count>=%dx, min reads=%d\n\n",
-               GC_RSSI_FLOOR_DBM10 / 10.0,
-               GC_RSSI_MARGIN_DB10 / 10.0,
-               GC_COUNT_DOMINANCE,
-               GC_MIN_READS);
-        printf("[GC] Connecting...\n");
-    }
+    printf(CYAN "===== Dual-Antenna RFID Live Scanner (arbitrated) =====" RESET "\n");
+    printf("Port      : %s @ %d baud\n", GC_PORT, GC_BAUDRATE);
+    printf("Power     : %u mW (both antennas)\n", power);
+    printf("Scan rate : maximum (no sleep between sweeps)\n");
+    printf("Decision  : 1 attribution + 1 summary line every %u ms\n", g_decision_window_ms);
+    if (g_duration_s > 0.0)
+        printf("Duration  : %.3f s then auto-stop\n", g_duration_s);
+    else
+        printf("Duration  : until Ctrl+C\n");
+    printf("Antennas  : %s, %s  (150 mm centre-to-centre)\n", sources[0], sources[1]);
+    printf("Arbitration: floor=%.1f dBm, margin=%.1f dB, count>=%dx, min reads=%d\n\n",
+           GC_RSSI_FLOOR_DBM10 / 10.0,
+           GC_RSSI_MARGIN_DB10 / 10.0,
+           GC_COUNT_DOMINANCE,
+           GC_MIN_READS);
+    printf("[GC] Connecting...\n");
 
     ec = CAENRFID_Connect(&reader, CAENRFID_RS232, &port_params);
     if (ec != CAENRFID_StatusOK) {
@@ -541,16 +511,15 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  - Check USB cable\n");
         fprintf(stderr, "  - Try: sudo chmod 666 %s\n", GC_PORT);
         fprintf(stderr, "  - Or:  sudo usermod -a -G dialout $USER  (then re-login)\n");
-        if (g_csv) fclose(g_csv);
         return -1;
     }
 
     ec = CAENRFID_GetReaderInfo(&reader, model, serial);
-    if (ec == CAENRFID_StatusOK && !g_quiet)
+    if (ec == CAENRFID_StatusOK)
         printf("[GC] Reader: %s  Serial: %s\n", model, serial);
 
     char fwrel[MAX_FWREL_LENGTH + 1] = {0};
-    if (CAENRFID_GetFirmwareRelease(&reader, fwrel) == CAENRFID_StatusOK && !g_quiet)
+    if (CAENRFID_GetFirmwareRelease(&reader, fwrel) == CAENRFID_StatusOK)
         printf("[GC] Firmware: %s\n", fwrel);
 
     ec = CAENRFID_SetPower(&reader, power);
@@ -559,11 +528,13 @@ int main(int argc, char **argv) {
                 "value may be below the reader's hardware floor.\n",
                 power, ec);
     }
-    if (!g_quiet) {
-        printf("[GC] Ready. One line every %.3f s: arbitrated [(0) tag, (1) tag];\n"
-               "[GC] [S0=…/s S1=…/s] is the measured scan rate per antenna. Ctrl+C to stop.\n\n",
-               g_decision_window_ms / 1000.0);
-    }
+    /* This is the line test_logger.py waits for before declaring a trial
+       live. Do NOT rename without updating READER_READY_RE on the Python
+       side. */
+    printf("[GC] Ready. One line every %.3f s: arbitrated [(0) tag, (1) tag];\n"
+           "[GC] [S0=…/s S1=…/s] is the measured scan rate per antenna. Ctrl+C to stop.\n\n",
+           g_decision_window_ms / 1000.0);
+    fflush(stdout);
 
     running = 1;
 
@@ -626,9 +597,9 @@ int main(int argc, char **argv) {
         /* Has the decision window elapsed? If so, run arbitration on
            every EPC seen during the window, build the display buffer
            with only the unambiguous attributions, print one summary
-           line, write the CSV row, and reset for the next window. No
-           fixed sleep -- the inventory call itself is the only thing
-           pacing the loop. */
+           line + one [GC_WIN] line for the harness, and reset for the
+           next window. No fixed sleep -- the inventory call itself is
+           the only thing pacing the loop. */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         double elapsed_s = (now.tv_sec  - t_window_mono.tv_sec) +
@@ -669,18 +640,18 @@ int main(int argc, char **argv) {
 
             double t_window_end_unix = now_unix();
 
-            if (!g_quiet)
-                print_sweep_line(power, disp_bucket, disp_cnt, rate);
-
-            csv_write_window(g_csv, window_idx,
-                             t_window_start_unix, t_window_end_unix,
-                             power, elapsed_s * 1000.0,
-                             scans[0], scans[1],
-                             (elapsed_s > 0.0) ? (double)scans[0] / elapsed_s : 0.0,
-                             (elapsed_s > 0.0) ? (double)scans[1] / elapsed_s : 0.0,
-                             disp_bucket, disp_cnt,
-                             (unsigned)stats_count,
-                             dropped_floor, dropped_low, dropped_ambig);
+            /* Human-readable line first, then the machine-readable
+               [GC_WIN] line that test_logger.py parses. */
+            print_sweep_line(power, disp_bucket, disp_cnt, rate);
+            print_window_line(window_idx,
+                              t_window_start_unix, t_window_end_unix,
+                              power, elapsed_s * 1000.0,
+                              scans[0], scans[1],
+                              (elapsed_s > 0.0) ? (double)scans[0] / elapsed_s : 0.0,
+                              (elapsed_s > 0.0) ? (double)scans[1] / elapsed_s : 0.0,
+                              disp_bucket, disp_cnt,
+                              (unsigned)stats_count,
+                              dropped_floor, dropped_low, dropped_ambig);
 
             window_idx++;
             scans[0] = 0;
@@ -700,11 +671,6 @@ int main(int argc, char **argv) {
     }
 
     CAENRFID_Disconnect(&reader);
-    if (g_csv) {
-        fclose(g_csv);
-        g_csv = NULL;
-    }
-    if (!g_quiet)
-        printf("[GC] Disconnected.\n");
+    printf("[GC] Disconnected.\n");
     return 0;
 }

@@ -1,10 +1,18 @@
-# Compiled binary
+# Compiled binaries
 rfid_gc_live
 rfid_gc_live.exe
+rfid_standard
+rfid_standard.exe
 
 # Object files
 *.o
 *.obj
+
+# Test-harness thumbnail cache (regenerated from images/tags/*.png on demand)
+.thumbs/
+
+# Excel lock files (Office creates these when results.xlsx is open)
+~$*.xlsx
 
 # Editor / OS
 .vscode/
