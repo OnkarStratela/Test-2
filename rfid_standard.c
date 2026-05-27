@@ -9,23 +9,15 @@
 //
 // Tags visible (slot 0 is always antenna 0, slot 1 is always antenna 1).
 // Per-tag RSSI is printed in brackets right after the antenna number
-// in real dBm (one decimal place), followed by the backscatter PHASE
-// in degrees (also one decimal), exactly as reported by the reader
+// in real dBm (one decimal place), exactly as reported by the reader
 // (no filtering, no arbitration). Empty slots render as pure whitespace
 // so the comma and the other slot never shift columns:
-//   [TX=30 mW] [(0)(-63.1)(p123.4) E2801160600002054E1A1234,   (1)(-65.0)(p210.8) E2801160600002054E1A5678]
-//   [TX=30 mW] [(0)(-63.1)(p123.4) E2801160600002054E1A1234,                                              ]
-//   [TX=30 mW] [                                            ,   (1)(-65.0)(p210.8) E2801160600002054E1A5678]
+//   [TX=30 mW] [(0)(-63.1) E2801160600002054E1A1234,   (1)(-65.0) E2801160600002054E1A5678]
+//   [TX=30 mW] [(0)(-63.1) E2801160600002054E1A1234,                                      ]
+//   [TX=30 mW] [                                    ,   (1)(-65.0) E2801160600002054E1A5678]
 //
 // The reader reports RSSI in tenths of dBm internally (e.g. raw -650
 // == -65.0 dBm); we just divide by 10.0 for display.
-//
-// Phase: the CAEN easy2read protocol returns AVP_PHASE as a 16-bit value
-// from the Impinj E310 radio (R3100C Lepton3). On Impinj chips that
-// value is a 12-bit unsigned phase angle (0..4095 ↔ 0..360°), so we
-// display raw * 360.0 / 4096.0. Unwrapped phase is what tells you the
-// fine-grained tag distance (Δd = λ·Δφ / (4π)); λ ≈ 32.8 cm at 915 MHz
-// means one full 360° wrap ≈ 16.4 cm of round-trip motion.
 //
 // Antenna index in YELLOW; Src0 tag EPC in GREEN, Src1 tag EPC in RED.
 //
@@ -69,7 +61,6 @@ typedef struct {
     char    tag[2 * MAX_ID_LENGTH + 1];
     int     antenna;
     int16_t rssi;        /* tenths of dBm, as reported by the reader */
-    int16_t phase;       /* raw AVP_PHASE value (12-bit on Impinj E310) */
 } TagEntry;
 
 static void hex_str(uint8_t *bytes, uint16_t len, char *out) {
@@ -107,22 +98,9 @@ static void handle_sigint(int sig) {
 
 // Width (visible chars, ignoring ANSI colour codes) reserved for each
 // antenna slot inside the brackets. Comfortably fits
-// "(N)(-XXX.X)(pYYY.Y) " + a 24-char EPC-96 hex string; longer tags
+// "(N)(-XXX.X) " + a 24-char EPC-96 hex string; longer tags
 // overflow without truncation.
-#define SLOT_WIDTH 46
-
-// Convert the reader's raw 16-bit AVP_PHASE value into degrees.
-// The R3100C Lepton3 is built on the Impinj E310 radio, whose phase
-// register is 12-bit unsigned: 0..4095 maps linearly to 0..360°. If
-// you ever swap to a reader that returns phase in a different scale
-// (e.g. centidegrees), just change this single constant.
-#define PHASE_RAW_FULLSCALE 4096.0
-static inline double phase_deg(int16_t raw)
-{
-    /* AVP_PHASE is read as a uint16_t; the cast keeps it non-negative
-       even though the struct field is int16_t for legacy reasons. */
-    return ((uint16_t)raw) * 360.0 / PHASE_RAW_FULLSCALE;
-}
+#define SLOT_WIDTH 38
 
 // Sweep output:
 //   - bare [] when no antenna saw any tag
@@ -154,15 +132,13 @@ static void print_sweep_line(uint32_t power,
         /* Visible width of the slot content (excludes ANSI codes) so we
            can right-pad to SLOT_WIDTH and keep the ']' column stable.
            Reader RSSI is in tenths of dBm, so we display it as a real
-           dBm value with one decimal (e.g. raw -631 -> "-63.1"). The
-           Phase is decoded into degrees with one decimal as well. */
+           dBm value with one decimal (e.g. raw -631 -> "-63.1"). */
         int visible = 3; /* "(N)" */
         for (int i = 0; i < cnt[ant]; i++) {
             char rbuf[24];
             int rlen = snprintf(rbuf, sizeof rbuf,
-                                "(%.1f)(p%.1f) ",
-                                bucket[ant][i].rssi / 10.0,
-                                phase_deg(bucket[ant][i].phase));
+                                "(%.1f) ",
+                                bucket[ant][i].rssi / 10.0);
             if (i > 0) visible += 1; /* space between multiple tags */
             visible += rlen + (int)strlen(bucket[ant][i].tag);
         }
@@ -171,9 +147,8 @@ static void print_sweep_line(uint32_t power,
         printf(YELLOW "(%d)" RESET, ant);
         for (int i = 0; i < cnt[ant]; i++) {
             if (i > 0) printf(" ");
-            printf("(%.1f)(p%.1f) %s%s" RESET,
+            printf("(%.1f) %s%s" RESET,
                    bucket[ant][i].rssi / 10.0,
-                   phase_deg(bucket[ant][i].phase),
                    tagcol, bucket[ant][i].tag);
         }
         int pad = SLOT_WIDTH - visible;
@@ -276,7 +251,7 @@ int main(int argc, char **argv) {
             ec = CAENRFID_InventoryTag(&reader, (char *)sources[ant],
                                        0, 0, 0,
                                        NULL, 0,
-                                       RSSI | PHASE,
+                                       RSSI,
                                        &tag_list, &num_tags);
 
             if (ec == CAENRFID_StatusOK && num_tags > 0) {
@@ -287,7 +262,6 @@ int main(int argc, char **argv) {
                                 bucket[ant][cnt[ant]].tag);
                         bucket[ant][cnt[ant]].antenna = ant;
                         bucket[ant][cnt[ant]].rssi    = node->Tag.RSSI;
-                        bucket[ant][cnt[ant]].phase   = node->Tag.Phase;
                         cnt[ant]++;
                     }
                     CAENRFIDTagList *next = node->Next;

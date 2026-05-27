@@ -10,16 +10,16 @@
 //     (free-space path-loss only; reality usually adds more attenuation
 //     from antenna pattern roll-off and the dielectric of the housing).
 //
-// Goal: over every 2-second window decide *which* antenna actually
+// Goal: over every decision window decide *which* antenna actually
 // owns each EPC, with ZERO cross-reads. A tag sitting over antenna A
 // must NEVER show up in antenna B's slot, even when antenna B picks
 // up a faint leakage read of the same tag.
 //
 // How: we drive both antennas serially at maximum physical speed (no
-// sleep between sweeps, exactly as before). For every read returned by
+// sleep between sweeps). For every read returned by
 // CAENRFID_InventoryTag we update a per-EPC stats table that tracks,
 // per antenna, the read count and the maximum RSSI seen during the
-// window. When the 2-second window closes we run an arbitration pass
+// window. When the decision window closes we run an arbitration pass
 // that promotes a tag onto an antenna's slot ONLY if that antenna is
 // dominant in both signal strength AND read count.
 //
@@ -34,52 +34,29 @@
 //       count[winner] >= GC_COUNT_DOMINANCE * count[loser]
 //     If either condition fails -> ambiguous, drop the tag entirely.
 //
-// The reader is asked for RSSI only (no PHASE). The displayed RSSI is
-// the maximum value seen by the winning antenna across the window
-// (closest to 0 dBm = strongest read = most confident attribution).
-// The reader reports RSSI in tenths of dBm; we divide by 10.0 for
-// display.
+// The reader is asked for RSSI only. The displayed RSSI is the maximum
+// value seen by the winning antenna across the window (closest to 0 dBm
+// = strongest read = most confident attribution). The reader reports
+// RSSI in tenths of dBm; we divide by 10.0 for display.
 //
-// Output (identical to previous version minus the phase column):
+// Output format (identical to rfid_standard.c):
 //
-// Empty (no tag was decisively attributed during the 2 s window):
-//   [S0=137/s S1=137/s] []
+// Empty (no tag was decisively attributed during the window):
+//   []
 //
 // With attribution -- slot 0 is always antenna 0, slot 1 is always
 // antenna 1, and empty slots render as pure whitespace so the comma
 // and the other slot never shift columns:
-//   [TX=30 mW] [S0=137/s S1=137/s] [(0)(-58.3) E2801160600002054E1A1234,   (1)(-61.7) E2801160600002054E1A5678]
-//   [TX=30 mW] [S0=137/s S1=137/s] [(0)(-58.3) E2801160600002054E1A1234,                                      ]
-//   [TX=30 mW] [S0=137/s S1=137/s] [                                    ,   (1)(-61.7) E2801160600002054E1A5678]
+//   [TX=30 mW] [(0)(-58.3) E2801160600002054E1A1234,   (1)(-61.7) E2801160600002054E1A5678]
+//   [TX=30 mW] [(0)(-58.3) E2801160600002054E1A1234,                                      ]
+//   [TX=30 mW] [                                    ,   (1)(-61.7) E2801160600002054E1A5678]
 //
 // Antenna index in YELLOW; Src0 tag EPC in GREEN, Src1 tag EPC in RED.
 //
 // Usage:
-//   ./rfid_gc_live                         both antennas at default power
-//   ./rfid_gc_live <mW>                    both antennas at <mW> (global power)
-//   ./rfid_gc_live -h | --help             show usage
-//
-// Test-harness extensions (all optional, fully backwards compatible):
-//   ./rfid_gc_live 30 --duration 3         exit after 3 s instead of Ctrl+C
-//   ./rfid_gc_live 30 --window-ms 250      override the 1000 ms decision window
-//
-// Stdout protocol consumed by test_logger.py:
-//
-// At the end of every decision window the binary emits one machine-
-// readable line in addition to the original human-readable colour line:
-//
-//   [GC_WIN] win=N t_start=UNIX_FLOAT t_end=UNIX_FLOAT power_mw=N
-//           win_ms=FLOAT scans_0=N scans_1=N rate_0=FLOAT rate_1=FLOAT
-//           ant0_epc=EPC|EPC|... ant0_rssi=DBM|DBM|...
-//           ant1_epc=EPC|EPC|... ant1_rssi=DBM|DBM|...
-//           unique=N drop_floor=N drop_low=N drop_amb=N
-//
-// All values are `key=value` pairs separated by single spaces, no value
-// contains whitespace. Empty slots use the literal "-" (so the line is
-// always parseable with a single regex). Multiple tags attributed to
-// the same antenna in one window are pipe-separated within the EPC
-// and RSSI fields. The pretty colour line is printed first for the
-// human at the terminal; test_logger.py ignores it.
+//   ./rfid_gc_live              both antennas at default power
+//   ./rfid_gc_live <mW>         both antennas at <mW> (global power)
+//   ./rfid_gc_live -h | --help  show usage
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,9 +76,7 @@
 #define DEFAULT_POWER_MW    30            // sensible default for ~7 cm read zone
 #define MIN_POWER_MW        1             // reader rejects below its hardware floor
 #define MAX_POWER_MW        316           // R3100C Lepton3 max (25 dBm)
-#define GC_RATE_WINDOW_MS   1000          // default decision/arbitration window (overridable via --window-ms)
-#define GC_MIN_WINDOW_MS    50            // sanity floor for --window-ms
-#define GC_MAX_WINDOW_MS    60000         // sanity ceiling for --window-ms
+#define GC_DECISION_MS      1000          // arbitration / display window length
 #define GC_MAX_TAGS         64            // max distinct EPCs tracked per window
 #define ANTENNA_COUNT       2
 #define MAX_ID_LENGTH       64
@@ -124,22 +99,6 @@
 #define RESET  "\033[0m"
 
 volatile int running = 0;
-
-// Test-harness state, set once in main(). Both flags default to "no
-// change" so an invocation without any flags behaves exactly like the
-// original interactive scanner.
-static double   g_duration_s          = 0.0;            // 0 = run until Ctrl+C
-static uint32_t g_decision_window_ms  = GC_RATE_WINDOW_MS;
-
-// Arbitration outcome categories. Used to populate per-window drop
-// counters so the test harness can distinguish "tag is missed" from
-// "tag is read but rejected as ambiguous/leakage".
-typedef enum {
-    ATTR_OK = 0,                // tag attributed to winner; not a drop
-    ATTR_DROPPED_BELOW_FLOOR,   // winner's max RSSI < GC_RSSI_FLOOR_DBM10
-    ATTR_DROPPED_LOW_COUNT,     // winner saw fewer than GC_MIN_READS reads
-    ATTR_DROPPED_AMBIGUOUS,     // both antennas saw it but dominance missed
-} ArbResult;
 
 // One entry to display in a slot after arbitration.
 typedef struct {
@@ -166,17 +125,12 @@ static void hex_str(uint8_t *bytes, uint16_t len, char *out) {
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
-        "  %s [<mW>] [--duration <sec>] [--window-ms <ms>]\n"
-        "\n"
-        "Positional:\n"
-        "  <mW>               TX power in mW (range %d..%d, default %d)\n"
-        "\n"
-        "Options:\n"
-        "  --duration <sec>   Stop automatically after <sec> seconds (float; 0 = run forever)\n"
-        "  --window-ms <ms>   Decision-window length in ms (default %d, range %d..%d)\n"
-        "  -h | --help        Show this message\n",
-        prog, MIN_POWER_MW, MAX_POWER_MW, DEFAULT_POWER_MW,
-        GC_RATE_WINDOW_MS, GC_MIN_WINDOW_MS, GC_MAX_WINDOW_MS);
+        "  %s              both antennas at %d mW (default)\n"
+        "  %s <mW>         both antennas at <mW> (global power)\n"
+        "  %s -h | --help  show this message\n"
+        "\nValid power range: %d..%d mW\n",
+        prog, DEFAULT_POWER_MW, prog, prog,
+        MIN_POWER_MW, MAX_POWER_MW);
 }
 
 static bool parse_power(const char *s, uint32_t *out) {
@@ -187,71 +141,6 @@ static bool parse_power(const char *s, uint32_t *out) {
     if (v < MIN_POWER_MW || v > MAX_POWER_MW) return false;
     *out = (uint32_t)v;
     return true;
-}
-
-// Parse a non-negative double from string. Returns false on garbage,
-// negative values, or non-finite values. End-of-string must be reached
-// exactly so trailing junk like "3.0x" is rejected.
-static bool parse_nneg_double(const char *s, double *out) {
-    if (s == NULL || *s == '\0') return false;
-    char *end = NULL;
-    double v = strtod(s, &end);
-    if (end == s || *end != '\0') return false;
-    if (!(v >= 0.0)) return false;
-    *out = v;
-    return true;
-}
-
-// Parse a positive int from string into a uint32_t with a [lo, hi]
-// range check. Returns false on garbage or out-of-range values.
-static bool parse_u32_range(const char *s, uint32_t lo, uint32_t hi, uint32_t *out) {
-    if (s == NULL || *s == '\0') return false;
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (end == s || *end != '\0') return false;
-    if (v < (long)lo || v > (long)hi) return false;
-    *out = (uint32_t)v;
-    return true;
-}
-
-// CLI parser. Returns 0 on success (caller proceeds), 1 if --help was
-// shown (caller should exit 0), -1 on parse error (caller should exit 1).
-// Backwards compatible: a bare numeric positional argument is still
-// treated as the TX power, so the old "./rfid_gc_live 30" form keeps
-// working.
-static int parse_args(int argc, char **argv,
-                      uint32_t *power,
-                      double *duration_s,
-                      uint32_t *window_ms)
-{
-    for (int i = 1; i < argc; i++) {
-        const char *a = argv[i];
-
-        if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
-            usage(argv[0]);
-            return 1;
-        }
-        if (strcmp(a, "--duration") == 0) {
-            if (i + 1 >= argc) { usage(argv[0]); return -1; }
-            if (!parse_nneg_double(argv[++i], duration_s)) { usage(argv[0]); return -1; }
-            continue;
-        }
-        if (strcmp(a, "--window-ms") == 0) {
-            if (i + 1 >= argc) { usage(argv[0]); return -1; }
-            if (!parse_u32_range(argv[++i], GC_MIN_WINDOW_MS, GC_MAX_WINDOW_MS, window_ms)) {
-                usage(argv[0]);
-                return -1;
-            }
-            continue;
-        }
-        if (a[0] != '-') {
-            if (!parse_power(a, power)) { usage(argv[0]); return -1; }
-            continue;
-        }
-        usage(argv[0]);
-        return -1;
-    }
-    return 0;
 }
 
 static void handle_sigint(int sig) {
@@ -285,134 +174,52 @@ static int stats_find_or_insert(TagStats *stats, int *count, const char *epc)
 
 // Apply the arbitration rule and return the winning antenna index
 // (0 or 1), or -1 if the tag is ambiguous / leakage and should NOT
-// be displayed. When `reason` is non-NULL, write the precise outcome
-// category there; the test harness uses it to populate per-window drop
-// counters. See the file header for the rule definition.
-static int stats_arbitrate(const TagStats *s, ArbResult *reason)
+// be displayed. See the file header for the rule definition.
+static int stats_arbitrate(const TagStats *s)
 {
     int winner, loser;
     if (s->max_rssi[0] >= s->max_rssi[1]) { winner = 0; loser = 1; }
     else                                  { winner = 1; loser = 0; }
 
     /* Need a real, strong observation on the winning antenna. */
-    if (s->count[winner] < (unsigned)GC_MIN_READS) {
-        if (reason) *reason = ATTR_DROPPED_LOW_COUNT;
+    if (s->count[winner] < (unsigned)GC_MIN_READS)
         return -1;
-    }
-    if (s->max_rssi[winner] < GC_RSSI_FLOOR_DBM10) {
-        if (reason) *reason = ATTR_DROPPED_BELOW_FLOOR;
+    if (s->max_rssi[winner] < GC_RSSI_FLOOR_DBM10)
         return -1;
-    }
 
     /* Only the winner saw it -> clean attribution. */
-    if (s->count[loser] == 0) {
-        if (reason) *reason = ATTR_OK;
+    if (s->count[loser] == 0)
         return winner;
-    }
 
     /* Both antennas saw it -> require dominance in BOTH axes. If
        either margin is missed we drop the tag entirely, which is the
        "zero cross-read" guarantee. */
     int16_t margin = s->max_rssi[winner] - s->max_rssi[loser];
-    if (margin < GC_RSSI_MARGIN_DB10) {
-        if (reason) *reason = ATTR_DROPPED_AMBIGUOUS;
+    if (margin < GC_RSSI_MARGIN_DB10)
         return -1;
-    }
-    if (s->count[winner] < (unsigned)GC_COUNT_DOMINANCE * s->count[loser]) {
-        if (reason) *reason = ATTR_DROPPED_AMBIGUOUS;
+    if (s->count[winner] < (unsigned)GC_COUNT_DOMINANCE * s->count[loser])
         return -1;
-    }
 
-    if (reason) *reason = ATTR_OK;
     return winner;
 }
 
-// Wall-clock seconds since the Unix epoch as a double. Used for the
-// per-window timestamps so trials can be aligned across machines and
-// log files. We never use this for the inter-window pacing itself;
-// that's still CLOCK_MONOTONIC, immune to NTP slew.
-static double now_unix(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-}
-
-// Emit ONE machine-readable line per decision window for the test
-// harness. Format documented at the top of this file. Empty antenna
-// slots use the literal "-" so the line is always parseable with a
-// single key=value regex; multiple attributed tags on one antenna
-// are pipe-separated within ant<i>_epc and ant<i>_rssi.
-static void print_window_line(unsigned window_idx,
-                              double t_start_unix,
-                              double t_end_unix,
-                              uint32_t power,
-                              double window_ms_actual,
-                              unsigned long scans_0,
-                              unsigned long scans_1,
-                              double rate_0_hz, double rate_1_hz,
-                              TagEntry bucket[ANTENNA_COUNT][GC_MAX_TAGS],
-                              const int cnt[ANTENNA_COUNT],
-                              unsigned unique_epcs,
-                              unsigned dropped_floor,
-                              unsigned dropped_count,
-                              unsigned dropped_ambig)
-{
-    printf("[GC_WIN] win=%u t_start=%.6f t_end=%.6f power_mw=%u "
-           "win_ms=%.3f scans_0=%lu scans_1=%lu rate_0=%.2f rate_1=%.2f ",
-           window_idx, t_start_unix, t_end_unix, power,
-           window_ms_actual, scans_0, scans_1, rate_0_hz, rate_1_hz);
-
-    for (int ant = 0; ant < ANTENNA_COUNT; ant++) {
-        printf("ant%d_epc=", ant);
-        if (cnt[ant] == 0) {
-            fputs("-", stdout);
-        } else {
-            for (int i = 0; i < cnt[ant]; i++) {
-                if (i > 0) fputc('|', stdout);
-                fputs(bucket[ant][i].tag, stdout);
-            }
-        }
-        printf(" ant%d_rssi=", ant);
-        if (cnt[ant] == 0) {
-            fputs("-", stdout);
-        } else {
-            for (int i = 0; i < cnt[ant]; i++) {
-                if (i > 0) fputc('|', stdout);
-                printf("%.1f", bucket[ant][i].rssi / 10.0);
-            }
-        }
-        fputc(' ', stdout);
-    }
-
-    printf("unique=%u drop_floor=%u drop_low=%u drop_amb=%u\n",
-           unique_epcs, dropped_floor, dropped_count, dropped_ambig);
-    fflush(stdout);
-}
-
-// Summary output for one decision window:
-//   - "[S0=N/s S1=N/s] []" when arbitration attributed nothing
-//   - otherwise: [TX=…] [S0=N/s S1=N/s] [<slot0>,   <slot1>]
+// Sweep output (identical format to rfid_standard.c):
+//   - bare [] when arbitration attributed no tag
+//   - otherwise: [TX=…] [<slot0>,   <slot1>]
 //     Each slot is padded to SLOT_WIDTH. If an antenna won no tags in
 //     the window, its slot is pure whitespace (no "(N)"), so the comma
 //     and the other slot keep their column positions and nothing shifts.
-//     The scans/second figure is measured over the window: it is the
-//     count of CAENRFID_InventoryTag calls per antenna divided by the
-//     elapsed window time.
 static void print_sweep_line(uint32_t power,
                              TagEntry bucket[ANTENNA_COUNT][GC_MAX_TAGS],
-                             const int cnt[ANTENNA_COUNT],
-                             const int rate[ANTENNA_COUNT])
+                             const int cnt[ANTENNA_COUNT])
 {
     if (cnt[0] == 0 && cnt[1] == 0) {
-        printf(CYAN "[S0=%d/s S1=%d/s]" RESET " []\n", rate[0], rate[1]);
+        printf("[]\n");
         fflush(stdout);
         return;
     }
 
-    printf(CYAN "[TX=%u mW]" RESET " "
-           CYAN "[S0=%d/s S1=%d/s]" RESET " [",
-           (unsigned)power, rate[0], rate[1]);
+    printf(CYAN "[TX=%u mW]" RESET " [", (unsigned)power);
 
     for (int ant = 0; ant < ANTENNA_COUNT; ant++) {
         if (ant > 0)
@@ -457,10 +264,19 @@ int main(int argc, char **argv) {
 
     uint32_t power = DEFAULT_POWER_MW;
 
-    int pa = parse_args(argc, argv, &power,
-                        &g_duration_s, &g_decision_window_ms);
-    if (pa == 1)      return 0;   /* --help printed */
-    else if (pa < 0)  return 1;   /* parse error printed */
+    if (argc == 2) {
+        if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+            usage(argv[0]);
+            return 0;
+        }
+        if (!parse_power(argv[1], &power)) {
+            usage(argv[0]);
+            return 1;
+        }
+    } else if (argc != 1) {
+        usage(argv[0]);
+        return 1;
+    }
 
     CAENRFIDErrorCodes ec;
     CAENRFIDReader reader = {
@@ -491,26 +307,21 @@ int main(int argc, char **argv) {
     printf(CYAN "===== Dual-Antenna RFID Live Scanner (arbitrated) =====" RESET "\n");
     printf("Port      : %s @ %d baud\n", GC_PORT, GC_BAUDRATE);
     printf("Power     : %u mW (both antennas)\n", power);
-    printf("Scan rate : maximum (no sleep between sweeps)\n");
-    printf("Decision  : 1 attribution + 1 summary line every %u ms\n", g_decision_window_ms);
-    if (g_duration_s > 0.0)
-        printf("Duration  : %.3f s then auto-stop\n", g_duration_s);
-    else
-        printf("Duration  : until Ctrl+C\n");
+    printf("Decision  : %d ms window\n", GC_DECISION_MS);
     printf("Antennas  : %s, %s  (150 mm centre-to-centre)\n", sources[0], sources[1]);
     printf("Arbitration: floor=%.1f dBm, margin=%.1f dB, count>=%dx, min reads=%d\n\n",
            GC_RSSI_FLOOR_DBM10 / 10.0,
            GC_RSSI_MARGIN_DB10 / 10.0,
            GC_COUNT_DOMINANCE,
            GC_MIN_READS);
-    printf("[GC] Connecting...\n");
 
+    printf("[GC] Connecting...\n");
     ec = CAENRFID_Connect(&reader, CAENRFID_RS232, &port_params);
     if (ec != CAENRFID_StatusOK) {
-        fprintf(stderr, "[GC] ERROR: Could not connect (code %d)\n", ec);
-        fprintf(stderr, "  - Check USB cable\n");
-        fprintf(stderr, "  - Try: sudo chmod 666 %s\n", GC_PORT);
-        fprintf(stderr, "  - Or:  sudo usermod -a -G dialout $USER  (then re-login)\n");
+        printf("[GC] ERROR: Could not connect (code %d)\n", ec);
+        printf("  - Check USB cable\n");
+        printf("  - Try: sudo chmod 666 %s\n", GC_PORT);
+        printf("  - Or:  sudo usermod -a -G dialout $USER  (then re-login)\n");
         return -1;
     }
 
@@ -524,17 +335,11 @@ int main(int argc, char **argv) {
 
     ec = CAENRFID_SetPower(&reader, power);
     if (ec != CAENRFID_StatusOK) {
-        fprintf(stderr, "[GC] WARNING: SetPower(%u) returned %d -- "
-                "value may be below the reader's hardware floor.\n",
-                power, ec);
+        printf("[GC] WARNING: SetPower(%u) returned %d -- "
+               "value may be below the reader's hardware floor.\n",
+               power, ec);
     }
-    /* This is the line test_logger.py waits for before declaring a trial
-       live. Do NOT rename without updating READER_READY_RE on the Python
-       side. */
-    printf("[GC] Ready. One line every %.3f s: arbitrated [(0) tag, (1) tag];\n"
-           "[GC] [S0=…/s S1=…/s] is the measured scan rate per antenna. Ctrl+C to stop.\n\n",
-           g_decision_window_ms / 1000.0);
-    fflush(stdout);
+    printf("[GC] Ready. Empty sweeps print []. Tagged sweeps prepend [TX …]. Ctrl+C to stop.\n\n");
 
     running = 1;
 
@@ -543,19 +348,9 @@ int main(int argc, char **argv) {
     TagStats stats[GC_MAX_TAGS];
     int      stats_count = 0;
 
-    /* scans[ant] counts CAENRFID_InventoryTag calls per antenna inside
-       the current window; we divide by the actual elapsed window time
-       to get the displayed scans/second. */
-    unsigned long scans[ANTENNA_COUNT] = {0, 0};
-
-    /* Window timing. We track monotonic time for elapsed-since-window
-       and a wall-clock anchor so CSV rows are usable for correlating
-       across machines and log files. */
+    /* Window timing uses CLOCK_MONOTONIC so it is immune to NTP slew. */
     struct timespec t_window_mono;
     clock_gettime(CLOCK_MONOTONIC, &t_window_mono);
-    double t_run_start_unix    = now_unix();
-    double t_window_start_unix = t_run_start_unix;
-    unsigned window_idx = 0;
 
     while (running) {
 
@@ -568,10 +363,6 @@ int main(int argc, char **argv) {
                                        NULL, 0,
                                        RSSI,
                                        &tag_list, &num_tags);
-
-            /* Count every attempted inventory call; this is the figure
-               we report as scans/s/antenna. */
-            scans[ant]++;
 
             /* Walk the linked list returned by the reader. We always
                free every node; we only fold reads into `stats` when
@@ -597,32 +388,20 @@ int main(int argc, char **argv) {
         /* Has the decision window elapsed? If so, run arbitration on
            every EPC seen during the window, build the display buffer
            with only the unambiguous attributions, print one summary
-           line + one [GC_WIN] line for the harness, and reset for the
-           next window. No fixed sleep -- the inventory call itself is
-           the only thing pacing the loop. */
+           line, and reset for the next window. No fixed sleep -- the
+           inventory call itself is the only thing pacing the loop. */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed_s = (now.tv_sec  - t_window_mono.tv_sec) +
-                           (now.tv_nsec - t_window_mono.tv_nsec) / 1e9;
+        double elapsed_ms = (now.tv_sec  - t_window_mono.tv_sec) * 1000.0 +
+                            (now.tv_nsec - t_window_mono.tv_nsec) / 1e6;
 
-        if (elapsed_s * 1000.0 >= (double)g_decision_window_ms) {
+        if (elapsed_ms >= (double)GC_DECISION_MS) {
             TagEntry disp_bucket[ANTENNA_COUNT][GC_MAX_TAGS];
             int      disp_cnt[ANTENNA_COUNT] = {0, 0};
 
-            unsigned dropped_floor = 0, dropped_low = 0, dropped_ambig = 0;
-
             for (int i = 0; i < stats_count; i++) {
-                ArbResult reason = ATTR_OK;
-                int winner = stats_arbitrate(&stats[i], &reason);
-                if (winner < 0) {
-                    switch (reason) {
-                        case ATTR_DROPPED_BELOW_FLOOR: dropped_floor++; break;
-                        case ATTR_DROPPED_LOW_COUNT:   dropped_low++;   break;
-                        case ATTR_DROPPED_AMBIGUOUS:   dropped_ambig++; break;
-                        default: break;
-                    }
-                    continue;
-                }
+                int winner = stats_arbitrate(&stats[i]);
+                if (winner < 0) continue;
                 if (disp_cnt[winner] >= GC_MAX_TAGS) continue;
 
                 TagEntry *e = &disp_bucket[winner][disp_cnt[winner]++];
@@ -632,41 +411,10 @@ int main(int argc, char **argv) {
                 e->rssi    = stats[i].max_rssi[winner];
             }
 
-            int rate[ANTENNA_COUNT];
-            for (int ant = 0; ant < ANTENNA_COUNT; ant++)
-                rate[ant] = (elapsed_s > 0.0)
-                    ? (int)((double)scans[ant] / elapsed_s + 0.5)
-                    : 0;
+            print_sweep_line(power, disp_bucket, disp_cnt);
 
-            double t_window_end_unix = now_unix();
-
-            /* Human-readable line first, then the machine-readable
-               [GC_WIN] line that test_logger.py parses. */
-            print_sweep_line(power, disp_bucket, disp_cnt, rate);
-            print_window_line(window_idx,
-                              t_window_start_unix, t_window_end_unix,
-                              power, elapsed_s * 1000.0,
-                              scans[0], scans[1],
-                              (elapsed_s > 0.0) ? (double)scans[0] / elapsed_s : 0.0,
-                              (elapsed_s > 0.0) ? (double)scans[1] / elapsed_s : 0.0,
-                              disp_bucket, disp_cnt,
-                              (unsigned)stats_count,
-                              dropped_floor, dropped_low, dropped_ambig);
-
-            window_idx++;
-            scans[0] = 0;
-            scans[1] = 0;
-            stats_count = 0;
-            t_window_mono       = now;
-            t_window_start_unix = t_window_end_unix;
-
-            /* Auto-stop after --duration seconds, evaluated on the
-               window boundary so we never emit a partial window. */
-            if (g_duration_s > 0.0 &&
-                (t_window_end_unix - t_run_start_unix) >= g_duration_s)
-            {
-                running = 0;
-            }
+            stats_count   = 0;
+            t_window_mono = now;
         }
     }
 
