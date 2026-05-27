@@ -21,7 +21,7 @@ Each trial is **one row** in `beer-pour-results.xlsx` with these columns (in ord
 | `session_id`                 | Timestamp of the test session (groups all trials from one run together).            |
 | `scenario`                   | Physical setup under test (e.g. `drip_tray_empty_cup_empty`).                       |
 | `power_mw`                   | TX power used for this trial (mW).                                                  |
-| `swap_rate_3s_hz`            | Per-EPC antenna swaps observed within the first 3 s, in Hz. `0.0` = stable answer; rising values = the arbitrator was flipping the tag between antennas. |
+| `scans_in_3s`                | Total RFID inventory scans completed by both antennas combined inside the first 3 s of the trial — how much "work" the reader did to produce this row's result. Each antenna is driven at maximum rate (no sleep between scans), so this number reflects raw radio throughput at the chosen power level. |
 | `winning_antenna`            | Per-EPC home antenna (last 6 hex chars → `antN`). E.g. with two cups: `6E6F76 -> ant0, 6E6FD6 -> ant1`. |
 | `cross_reads`                | Number of EPCs that appeared on **both** antennas during the trial (same-tag leakage). **0 is the happy path.** Two different tags, each only on its own antenna, does **not** count. |
 | `best_rssi_winner_dbm`       | Strongest (closest-to-zero) RSSI on the winning antenna across the trial.           |

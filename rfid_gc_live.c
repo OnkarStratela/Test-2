@@ -39,17 +39,24 @@
 // = strongest read = most confident attribution). The reader reports
 // RSSI in tenths of dBm; we divide by 10.0 for display.
 //
-// Output format (identical to rfid_standard.c):
+// Output format:
+//
+// Every line is prefixed with the per-window scan counters
+// [S0=N S1=N] which are the number of CAENRFID_InventoryTag calls
+// completed on antenna 0 / antenna 1 inside this decision window.
+// Both antennas run at maximum rate (no sleep between sweeps), so
+// these counters tell the operator "how many attempts did each
+// antenna make to produce this line's result?".
 //
 // Empty (no tag was decisively attributed during the window):
-//   []
+//   [S0=137 S1=138] []
 //
 // With attribution -- slot 0 is always antenna 0, slot 1 is always
 // antenna 1, and empty slots render as pure whitespace so the comma
 // and the other slot never shift columns:
-//   [TX=30 mW] [(0)(-58.3) E2801160600002054E1A1234,   (1)(-61.7) E2801160600002054E1A5678]
-//   [TX=30 mW] [(0)(-58.3) E2801160600002054E1A1234,                                      ]
-//   [TX=30 mW] [                                    ,   (1)(-61.7) E2801160600002054E1A5678]
+//   [S0=137 S1=138] [TX=30 mW] [(0)(-58.3) E2801160600002054E1A1234,   (1)(-61.7) E2801160600002054E1A5678]
+//   [S0=137 S1=138] [TX=30 mW] [(0)(-58.3) E2801160600002054E1A1234,                                      ]
+//   [S0=137 S1=138] [TX=30 mW] [                                    ,   (1)(-61.7) E2801160600002054E1A5678]
 //
 // Antenna index in YELLOW; Src0 tag EPC in GREEN, Src1 tag EPC in RED.
 //
@@ -203,23 +210,32 @@ static int stats_arbitrate(const TagStats *s)
     return winner;
 }
 
-// Sweep output (identical format to rfid_standard.c):
-//   - bare [] when arbitration attributed no tag
-//   - otherwise: [TX=…] [<slot0>,   <slot1>]
-//     Each slot is padded to SLOT_WIDTH. If an antenna won no tags in
-//     the window, its slot is pure whitespace (no "(N)"), so the comma
-//     and the other slot keep their column positions and nothing shifts.
+// Sweep output:
+//   - "[S0=N S1=N] []" when arbitration attributed nothing this window
+//   - otherwise: [S0=N S1=N] [TX=…] [<slot0>,   <slot1>]
+//     S0/S1 are the number of CAENRFID_InventoryTag calls completed on
+//     each antenna during this decision window -- i.e. how many "attempts"
+//     the reader made before producing the result on this line. Both
+//     antennas are driven at maximum rate (no sleep between sweeps), so
+//     these counters answer the operator question "how many scans did
+//     both antennas perform to get the answer?". Each slot is padded
+//     to SLOT_WIDTH; empty slots are pure whitespace so the comma column
+//     never shifts.
 static void print_sweep_line(uint32_t power,
                              TagEntry bucket[ANTENNA_COUNT][GC_MAX_TAGS],
-                             const int cnt[ANTENNA_COUNT])
+                             const int cnt[ANTENNA_COUNT],
+                             const unsigned long scans[ANTENNA_COUNT])
 {
     if (cnt[0] == 0 && cnt[1] == 0) {
-        printf("[]\n");
+        printf(CYAN "[S0=%lu S1=%lu]" RESET " []\n",
+               scans[0], scans[1]);
         fflush(stdout);
         return;
     }
 
-    printf(CYAN "[TX=%u mW]" RESET " [", (unsigned)power);
+    printf(CYAN "[S0=%lu S1=%lu]" RESET " "
+           CYAN "[TX=%u mW]" RESET " [",
+           scans[0], scans[1], (unsigned)power);
 
     for (int ant = 0; ant < ANTENNA_COUNT; ant++) {
         if (ant > 0)
@@ -339,7 +355,7 @@ int main(int argc, char **argv) {
                "value may be below the reader's hardware floor.\n",
                power, ec);
     }
-    printf("[GC] Ready. Empty sweeps print []. Tagged sweeps prepend [TX …]. Ctrl+C to stop.\n\n");
+    printf("[GC] Ready. Each line is prefixed with [S0=N S1=N] scan counts. Ctrl+C to stop.\n\n");
 
     running = 1;
 
@@ -347,6 +363,12 @@ int main(int argc, char **argv) {
        Reset at the end of every window. */
     TagStats stats[GC_MAX_TAGS];
     int      stats_count = 0;
+
+    /* Inventory-call counters per antenna for the current decision
+       window. Reset every time we close a window so each printed line
+       reports just the scans that produced THAT line's result, not a
+       running total since startup. */
+    unsigned long scans[ANTENNA_COUNT] = { 0UL, 0UL };
 
     /* Window timing uses CLOCK_MONOTONIC so it is immune to NTP slew. */
     struct timespec t_window_mono;
@@ -363,6 +385,13 @@ int main(int argc, char **argv) {
                                        NULL, 0,
                                        RSSI,
                                        &tag_list, &num_tags);
+
+            /* Every attempted inventory call counts as one "scan",
+               regardless of whether it returned tags. This is the
+               number the harness adds up across the verification
+               window to answer "how many attempts did both antennas
+               make to get the result?". */
+            scans[ant]++;
 
             /* Walk the linked list returned by the reader. We always
                free every node; we only fold reads into `stats` when
@@ -411,9 +440,11 @@ int main(int argc, char **argv) {
                 e->rssi    = stats[i].max_rssi[winner];
             }
 
-            print_sweep_line(power, disp_bucket, disp_cnt);
+            print_sweep_line(power, disp_bucket, disp_cnt, scans);
 
             stats_count   = 0;
+            scans[0]      = 0;
+            scans[1]      = 0;
             t_window_mono = now;
         }
     }

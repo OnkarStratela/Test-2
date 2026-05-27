@@ -21,8 +21,10 @@ each trial is one row with these columns:
 - ``session_id``           timestamp of the test session
 - ``scenario``             physical setup under test
 - ``power_mw``             TX power used
-- ``swap_rate_3s_hz``      antenna swaps per second within the first 3 s
-                           (a low-noise call gives 0.0)
+- ``scans_in_3s``          total CAENRFID_InventoryTag attempts both
+                           antennas completed in the first 3 s of the
+                           trial (the work the reader did to produce
+                           the result on this row)
 - ``winning_antenna``      per-EPC home antenna, e.g. ``6E6F76 -> ant0``
 - ``cross_reads``          number of EPCs seen on BOTH antennas (same-tag
                            leakage; 0 is the happy path)
@@ -105,21 +107,26 @@ ROW_HEIGHT_PT    = 64
 # ──────────────────────── output line parsing ───────────────────────
 #
 # rfid_gc_live emits its sweep lines with ANSI colour codes (cyan for the
-# [TX=...] prefix, yellow for the (N) antenna labels, green/red for the
-# EPCs). We strip the colours first, then run a small set of regexes on
-# the plain text. The line shapes after stripping are:
+# [S0=N S1=N] / [TX=...] prefixes, yellow for the (N) antenna labels,
+# green/red for the EPCs). We strip the colours first, then run a small
+# set of regexes on the plain text. The line shapes after stripping are:
 #
-#   "[GC] Ready. Empty sweeps print []. ..."         -> start of trial
-#   "[]"                                              -> empty window
-#   "[TX=30 mW] [(0)(-58.3) EPC0  ,   (1)(-61.7) EPC1  ]"
-#   "[TX=30 mW] [(0)(-58.3) EPC0  ,                                  ]"
-#   "[TX=30 mW] [                  ,   (1)(-61.7) EPC1               ]"
+#   "[GC] Ready. ..."                                 -> start of trial
+#   "[S0=137 S1=138] []"                              -> empty window
+#   "[S0=137 S1=138] [TX=30 mW] [(0)(-58.3) EPC0,   (1)(-61.7) EPC1]"
+#   "[S0=137 S1=138] [TX=30 mW] [(0)(-58.3) EPC0,                  ]"
+#   "[S0=137 S1=138] [TX=30 mW] [                ,   (1)(-61.7) EPC1]"
 #
 # Slot padding is just trailing whitespace, so strip() on each slot string
 # is enough; the comma is the only separator.
+#
+# The S0/S1 scan counters report how many CAENRFID_InventoryTag calls
+# the C binary completed on each antenna during the 1-second decision
+# window that produced the line. They reset at every window boundary.
 
 ANSI_RE          = re.compile(r"\x1b\[[0-9;]*m")
 READY_RE         = re.compile(r"\[GC\]\s+Ready\.")
+SCANS_PREFIX_RE  = re.compile(r"^\s*\[S0=(?P<s0>\d+)\s+S1=(?P<s1>\d+)\]\s*")
 EMPTY_WINDOW_RE  = re.compile(r"^\s*\[\]\s*$")
 WINDOW_RE        = re.compile(
     r"^\s*\[TX=(?P<power>\d+)\s*mW\]\s+\[(?P<inner>.*)\]\s*$"
@@ -145,12 +152,18 @@ def _parse_slot(slot: str) -> List[Tuple[str, float]]:
 class WindowRead:
     """One decision-window line from the C binary, with arrival timestamp.
 
-    ``t_offset_s`` is seconds since the trial's ``[GC] Ready`` line."""
+    ``t_offset_s`` is seconds since the trial's ``[GC] Ready`` line.
+    ``scans_ant0`` / ``scans_ant1`` come from the ``[S0=N S1=N]`` prefix
+    the C binary emits on every window line -- they're the number of
+    CAENRFID_InventoryTag calls completed on each antenna during this
+    decision window."""
 
     idx: int
     t_offset_s: float
     raw: str
     is_empty: bool
+    scans_ant0: int = 0
+    scans_ant1: int = 0
     ant0: List[Tuple[str, float]] = field(default_factory=list)
     ant1: List[Tuple[str, float]] = field(default_factory=list)
 
@@ -162,8 +175,22 @@ def parse_window_line(idx: int, t_offset_s: float, line: str) -> Optional[Window
     """Turn one stdout line from rfid_gc_live into a WindowRead, or None
     if the line isn't a sweep line at all (e.g. the Ready banner)."""
     clean = ANSI_RE.sub("", line).rstrip("\r\n")
+
+    # Pull the [S0=N S1=N] prefix off the front, if present. We tolerate
+    # its absence so trials run against an older C binary still produce
+    # parseable rows (scans_ant0/scans_ant1 will just stay at 0).
+    scans_ant0 = 0
+    scans_ant1 = 0
+    pm = SCANS_PREFIX_RE.match(clean)
+    if pm:
+        scans_ant0 = int(pm.group("s0"))
+        scans_ant1 = int(pm.group("s1"))
+        clean = clean[pm.end():]
+
     if EMPTY_WINDOW_RE.match(clean):
-        return WindowRead(idx=idx, t_offset_s=t_offset_s, raw=clean, is_empty=True)
+        return WindowRead(idx=idx, t_offset_s=t_offset_s, raw=clean,
+                          is_empty=True,
+                          scans_ant0=scans_ant0, scans_ant1=scans_ant1)
     m = WINDOW_RE.match(clean)
     if not m:
         return None
@@ -176,6 +203,8 @@ def parse_window_line(idx: int, t_offset_s: float, line: str) -> Optional[Window
         t_offset_s=t_offset_s,
         raw=clean,
         is_empty=False,
+        scans_ant0=scans_ant0,
+        scans_ant1=scans_ant1,
         ant0=_parse_slot(left.strip()),
         ant1=_parse_slot(right.strip()),
     )
@@ -264,38 +293,35 @@ class TrialResult:
             for epc, ant in sorted(homes.items())
         )
 
+    def _scans_in(self, antenna: int, deadline_s: float) -> int:
+        """Sum the per-window scan counts on ``antenna`` across every
+        window that closed within ``deadline_s`` seconds of trial start.
+        Returns 0 if the trial captured no windows within the window."""
+        total = 0
+        for w in self.windows:
+            if w.t_offset_s > deadline_s:
+                continue
+            total += w.scans_ant0 if antenna == 0 else w.scans_ant1
+        return total
+
     @property
-    def swap_rate_3s_hz(self) -> float:
-        """Per-EPC antenna swaps observed within the first
-        VERIFY_DEADLINE_S seconds of the trial, expressed as swaps per
-        second. A swap = the same EPC was attributed to one antenna in
-        one window and the other antenna in the next window where that
-        EPC appeared. Stable attribution (cup sitting on one antenna)
-        gives 0.0; constant flip-flopping rises with frequency. A useful
-        single-number measure of how 'noisy' the arbitrator's answer
-        was during the verification window."""
-        windows = [w for w in self.windows if w.t_offset_s <= VERIFY_DEADLINE_S]
-        if not windows or VERIFY_DEADLINE_S <= 0:
-            return 0.0
-        # Per EPC, build a time series of "which antenna this window
-        # thinks it lives on". When an EPC appears on BOTH antennas in
-        # the same window we pick the one with the stronger RSSI so the
-        # series remains a clean sequence of 0/1 values.
-        series: Dict[str, List[int]] = {}
-        for w in windows:
-            per_epc: Dict[str, Tuple[int, float]] = {}
-            for ant, tags in ((0, w.ant0), (1, w.ant1)):
-                for epc, rssi in tags:
-                    if epc not in per_epc or rssi > per_epc[epc][1]:
-                        per_epc[epc] = (ant, rssi)
-            for epc, (ant, _) in per_epc.items():
-                series.setdefault(epc, []).append(ant)
-        total_swaps = 0
-        for ants in series.values():
-            for i in range(1, len(ants)):
-                if ants[i] != ants[i - 1]:
-                    total_swaps += 1
-        return round(total_swaps / VERIFY_DEADLINE_S, 2)
+    def scans_ant0_in_3s(self) -> int:
+        """Number of CAENRFID_InventoryTag calls completed on antenna 0
+        during the first VERIFY_DEADLINE_S seconds of the trial."""
+        return self._scans_in(0, VERIFY_DEADLINE_S)
+
+    @property
+    def scans_ant1_in_3s(self) -> int:
+        """Number of CAENRFID_InventoryTag calls completed on antenna 1
+        during the first VERIFY_DEADLINE_S seconds of the trial."""
+        return self._scans_in(1, VERIFY_DEADLINE_S)
+
+    @property
+    def scans_in_3s(self) -> int:
+        """Total scan attempts both antennas made inside the 3-second
+        verification window -- a direct measure of how much work the
+        reader did before arriving at the result on this row."""
+        return self.scans_ant0_in_3s + self.scans_ant1_in_3s
 
     @property
     def ttv_s(self) -> Optional[float]:
@@ -383,7 +409,7 @@ TRIALS_HEADERS: List[str] = [
     "session_id",
     "scenario",
     "power_mw",
-    "swap_rate_3s_hz",
+    "scans_in_3s",
     "winning_antenna",
     "cross_reads",
     "best_rssi_winner_dbm",
@@ -399,7 +425,7 @@ TRIALS_WIDTHS: List[int] = [
     18,   # session_id
     34,   # scenario
     11,   # power_mw
-    16,   # swap_rate_3s_hz
+    14,   # scans_in_3s
     28,   # winning_antenna
     13,   # cross_reads
     20,   # best_rssi_winner_dbm
@@ -412,7 +438,7 @@ TRIALS_WIDTHS: List[int] = [
 # Columns rendered with a centred alignment (counts / scalars). Everything
 # else is left-aligned with wrapping.
 _CENTERED_TRIALS = {
-    "power_mw", "swap_rate_3s_hz", "cross_reads",
+    "power_mw", "scans_in_3s", "cross_reads",
     "best_rssi_winner_dbm", "result",
 }
 
@@ -639,7 +665,7 @@ def append_trial(session_id: str, t: TrialResult, comment: str = "") -> None:
         "session_id":           session_id,
         "scenario":             t.scenario,
         "power_mw":             t.power_mw,
-        "swap_rate_3s_hz":      t.swap_rate_3s_hz,
+        "scans_in_3s":          t.scans_in_3s,
         "winning_antenna":      t.winning_antenna_per_tag,
         "cross_reads":          t.cross_reads,
         "best_rssi_winner_dbm": t.best_rssi_winner
@@ -909,7 +935,9 @@ def main() -> int:
                     f"[Trial #{tentative_num}] {result.result} -- "
                     f"verified in {result.ttv_s:.2f} s, "
                     f"homes [{homes}], "
-                    f"swap rate {result.swap_rate_3s_hz:.2f} Hz, "
+                    f"{result.scans_in_3s} scans in 3 s "
+                    f"(ant0={result.scans_ant0_in_3s}, "
+                    f"ant1={result.scans_ant1_in_3s}), "
                     f"{cross_msg}, "
                     f"best RSSI {rssi}"
                 )
