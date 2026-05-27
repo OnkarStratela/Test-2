@@ -8,12 +8,6 @@ rfid_standard.exe
 *.o
 *.obj
 
-# Test-harness thumbnail cache (regenerated from images/tags/*.png on demand)
-.thumbs/
-
-# Excel lock files (Office creates these when results.xlsx is open)
-~$*.xlsx
-
 # Editor / OS
 .vscode/
 .idea/
