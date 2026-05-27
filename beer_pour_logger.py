@@ -12,33 +12,25 @@ decision window, and at every window boundary emits one line on stdout:
   with antenna 0 in the left slot, antenna 1 in the right slot. Empty slots
   render as pure whitespace so the comma column never shifts.
 
-The arbitration logic (zero-cross-read guarantee) is in the C binary; this
-script is purely a measurement harness. For every trial it:
+The harness does NOT ask the operator which antenna the cup is going to be
+slid over -- in real-world use the system has no advance knowledge of that.
+Instead it lets the arbitrator make the call and then characterises the
+quality of that call:
 
-1. Spawns a fresh ``rfid_gc_live <power_mw>`` subprocess so cross-trial
-   stats can't leak between cups.
-2. Waits for ``[GC] Ready`` -- that's the cue to slide the cup. The moment
-   we see that line is ``t = 0`` for the trial.
-3. Streams the binary's output to the operator's terminal (so they still
-   see the live ``[TX=...] [...]`` lines, exactly like running the binary
-   by hand) AND parses each window line in the background.
-4. After ``TRIAL_DURATION_S`` seconds, sends SIGINT so the C binary exits
-   cleanly (CAENRFID_Disconnect()), then computes:
+- ``winning_antenna``  the antenna with the most attributions across the
+                       trial (i.e. the system's "answer")
+- ``cross_reads``      number of windows that ALSO put a tag on the OTHER
+                       antenna -- a non-zero value means the arbitrator
+                       was flip-flopping during the slide, which is what
+                       the per-window dominance rule is supposed to
+                       prevent.
+- ``ttv_s``            seconds from "GO!" to the first window that
+                       attributed anything (= time-to-verification)
+- ``within_3s``        ``ttv_s <= 3.0`` (the product spec deadline)
+- ``result``           PASS / SLOW / DIRTY / FAIL one-word verdict
 
-   - ``ttv_s``       time of the first window that put any tag on the
-                     EXPECTED antenna (= "verification time")
-   - ``within_3s``   ttv_s <= 3.0
-   - ``cross_reads`` number of windows that put a tag on the OTHER antenna
-                     (these are the false attributions the arbitrator is
-                     meant to prevent)
-
-5. Appends one row to ``Trials`` (with the scenario + tag photos embedded
-   as thumbnails) and one row per window to ``Windows``.
-
-The four test axes are picked from menus and kept across trials until you
-change them ('p' = power, 's' = scenario, 't' = tag, 'a' = antenna,
-'q' = quit). Tag types are discovered from ``images/tags/*.png`` so adding
-a new tag is "drop a photo in the folder" -- nothing to edit in code.
+After every trial the operator is asked whether to keep that row -- press
+ENTER (or 'y') to append, 'n' to discard.
 
 Usage::
 
@@ -57,10 +49,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.drawing.image import Image as XLImage
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage
 
@@ -94,12 +87,13 @@ POWER_LEVELS_MW: List[int] = [30, 175, 316]
 # observe a couple of windows of behaviour after that.
 TRIAL_DURATION_S: float = 5.0
 
-# A tag must be attributed to the expected antenna within this many
-# seconds for the trial to pass. Matches the product spec: "verification
-# happens within 3 s of the user sliding a tagged cup over the antenna".
+# A tag must be attributed within this many seconds for the trial to
+# pass. Matches the product spec: "verification happens within 3 s of
+# the user sliding a tagged cup over the antenna".
 VERIFY_DEADLINE_S: float = 3.0
 
-# Embedded-thumbnail height for the photo columns.
+# Photo thumbnail height (pixels) embedded in the workbook. Row height
+# is in points; one row comfortably holds an 80-px-tall thumbnail.
 THUMB_HEIGHT_PX  = 80
 ROW_HEIGHT_PT    = 64
 
@@ -191,7 +185,6 @@ class TrialResult:
     scenario: str
     power_mw: int
     tag: str
-    expected_antenna: int            # 0 or 1
     trial_num: int
     start_time: dt.datetime          # wall-clock at [GC] Ready
     duration_s: float                # actual measured trial length
@@ -213,11 +206,23 @@ class TrialResult:
         return seen
 
     @property
+    def winning_antenna(self) -> Optional[int]:
+        """The antenna with the most attributed windows across the trial.
+        This is the system's "answer" -- whichever antenna the arbitrator
+        decided the cup was closest to. ``None`` if the trial saw no
+        attribution on either antenna."""
+        n0 = sum(1 for w in self.windows if w.ant0)
+        n1 = sum(1 for w in self.windows if w.ant1)
+        if n0 == 0 and n1 == 0:
+            return None
+        return 0 if n0 >= n1 else 1
+
+    @property
     def ttv_s(self) -> Optional[float]:
-        """Time (since trial start) of the first window with ANY tag on
-        the expected antenna. ``None`` if it never happened."""
+        """Time (since trial start) of the first window that put any tag
+        on any antenna. ``None`` if it never happened."""
         for w in self.windows:
-            if w.tags_on(self.expected_antenna):
+            if w.ant0 or w.ant1:
                 return round(w.t_offset_s, 3)
         return None
 
@@ -226,68 +231,97 @@ class TrialResult:
         return self.ttv_s is not None
 
     @property
-    def within_deadline(self) -> Optional[bool]:
-        if self.ttv_s is None:
-            return False
-        return self.ttv_s <= VERIFY_DEADLINE_S
+    def within_deadline(self) -> bool:
+        return self.ttv_s is not None and self.ttv_s <= VERIFY_DEADLINE_S
 
     @property
-    def n_hits_correct_ant(self) -> int:
-        return sum(1 for w in self.windows if w.tags_on(self.expected_antenna))
+    def n_hits_winner(self) -> int:
+        if self.winning_antenna is None:
+            return 0
+        return sum(1 for w in self.windows if w.tags_on(self.winning_antenna))
 
     @property
     def cross_reads(self) -> int:
-        """Number of windows where ANY tag was attributed to the antenna
-        the cup is NOT meant to be on. With the arbitrator working as
-        designed this should be 0 -- every >0 value is a false attribution
-        we want to investigate."""
-        other = 1 - self.expected_antenna
+        """Number of windows that attributed any tag to the OTHER antenna
+        (= not the winner). With the arbitrator's dominance rule working
+        as designed this should be 0; anything >0 means the trial was
+        flip-flopping between antennas, which is the failure mode we
+        care about avoiding in the beer-pour use case."""
+        if self.winning_antenna is None:
+            return 0
+        other = 1 - self.winning_antenna
         return sum(1 for w in self.windows if w.tags_on(other))
 
     @property
-    def best_rssi_correct_ant(self) -> Optional[float]:
-        """Strongest (closest to 0 dBm) RSSI we ever saw on the expected
-        antenna across the whole trial, or None if nothing was attributed
-        there."""
+    def clean(self) -> bool:
+        return self.cross_reads == 0
+
+    @property
+    def best_rssi_winner(self) -> Optional[float]:
+        """Strongest (closest-to-zero) RSSI we ever saw on the winning
+        antenna across the trial, or None if nothing was attributed."""
+        if self.winning_antenna is None:
+            return None
         best: Optional[float] = None
         for w in self.windows:
-            for _, rssi in w.tags_on(self.expected_antenna):
+            for _, rssi in w.tags_on(self.winning_antenna):
                 if best is None or rssi > best:
                     best = rssi
         return best
+
+    @property
+    def result(self) -> str:
+        """One-word verdict for the summary column:
+
+        - ``PASS``  verified, within 3 s, no cross-reads
+        - ``SLOW``  verified + clean but took longer than 3 s
+        - ``DIRTY`` verified but the other antenna also got hits at some
+                    point during the trial (= flip-flop, what the arbitrator
+                    is meant to prevent)
+        - ``FAIL``  never got any attribution
+        """
+        if not self.verified:
+            return "FAIL"
+        if not self.clean:
+            return "DIRTY"
+        if not self.within_deadline:
+            return "SLOW"
+        return "PASS"
 
 
 # ─────────────────────────── workbook I/O ───────────────────────────
 
 
-TRIALS_HEADERS = [
+TRIALS_HEADERS: List[str] = [
     "session_id",
     "trial_num",
     "scenario",
     "power_mw",
     "tag",
-    "expected_antenna",
     "start_time",
     "duration_s",
     "n_windows",
+    "result",
     "verified",
     "ttv_s",
     f"within_{int(VERIFY_DEADLINE_S)}s",
+    "winning_antenna",
+    "n_hits_winner",
     "cross_reads",
-    "n_hits_correct_ant",
-    "best_rssi_correct_ant_dbm",
+    "clean",
+    "best_rssi_winner_dbm",
     "detected_epcs",
     "notes",
     "scenario_photo",
     "tag_photo",
 ]
 
-TRIALS_WIDTHS = [
-    16, 10, 32, 9, 14, 18, 22, 11, 11,
-    10, 9, 11, 12, 18, 23, 60, 30, 22, 16,
+TRIALS_WIDTHS: List[int] = [
+    16, 10, 32, 9, 14, 22, 11, 11, 9, 10, 9,
+    11, 17, 14, 12, 8, 21, 60, 30, 22, 16,
 ]
 
-WINDOWS_HEADERS = [
+WINDOWS_HEADERS: List[str] = [
     "session_id",
     "trial_num",
     "scenario",
@@ -301,49 +335,137 @@ WINDOWS_HEADERS = [
     "ant1_rssis_dbm",
 ]
 
-WINDOWS_WIDTHS = [16, 10, 32, 9, 14, 11, 11, 36, 24, 36, 24]
+WINDOWS_WIDTHS: List[int] = [16, 10, 32, 9, 14, 11, 11, 36, 24, 36, 24]
+
+
+# Columns whose values are best displayed centred (counts, numbers, flags).
+_CENTERED_TRIALS = {
+    "trial_num", "power_mw", "duration_s", "n_windows",
+    "result", "verified", "ttv_s",
+    f"within_{int(VERIFY_DEADLINE_S)}s",
+    "winning_antenna", "n_hits_winner", "cross_reads", "clean",
+    "best_rssi_winner_dbm",
+}
+_CENTERED_WINDOWS = {
+    "trial_num", "power_mw", "window_idx", "t_offset_s",
+}
+
+# Result-column colour coding. Light fills + readable dark fonts so the
+# verdict is visible at a glance when scanning the sheet.
+RESULT_FILLS = {
+    "PASS":  PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
+    "SLOW":  PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
+    "DIRTY": PatternFill(start_color="FFD9B3", end_color="FFD9B3", fill_type="solid"),
+    "FAIL":  PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
+}
+RESULT_FONTS = {
+    "PASS":  Font(bold=True, color="006100"),
+    "SLOW":  Font(bold=True, color="9C5700"),
+    "DIRTY": Font(bold=True, color="9C5700"),
+    "FAIL":  Font(bold=True, color="9C0006"),
+}
+
+
+def _apply_header_style(ws: Any) -> None:
+    """Bold white text on a dark-blue fill, centred, wrapped, with a
+    1-pixel border. Also freezes the header row so it stays visible
+    when scrolling."""
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(start_color="305496", end_color="305496",
+                              fill_type="solid")
+    header_align = Alignment(horizontal="center", vertical="center",
+                             wrap_text=True)
+    thin_border = Border(
+        left=Side(style="thin", color="BFBFBF"),
+        right=Side(style="thin", color="BFBFBF"),
+        top=Side(style="thin", color="BFBFBF"),
+        bottom=Side(style="thin", color="BFBFBF"),
+    )
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+        cell.border = thin_border
+    ws.row_dimensions[1].height = 30
+    ws.freeze_panes = "A2"
+
+
+def _style_data_row(ws: Any, row: int, headers: List[str],
+                    centered_cols: set, result_col: Optional[int] = None,
+                    result_value: Optional[str] = None) -> None:
+    thin_border = Border(
+        left=Side(style="thin", color="E0E0E0"),
+        right=Side(style="thin", color="E0E0E0"),
+        top=Side(style="thin", color="E0E0E0"),
+        bottom=Side(style="thin", color="E0E0E0"),
+    )
+    centered = Alignment(horizontal="center", vertical="center")
+    left     = Alignment(horizontal="left",   vertical="center",
+                         wrap_text=True)
+
+    for col_idx, name in enumerate(headers, start=1):
+        cell = ws.cell(row=row, column=col_idx)
+        cell.border = thin_border
+        cell.alignment = centered if name in centered_cols else left
+
+    if result_col is not None and result_value in RESULT_FILLS:
+        cell = ws.cell(row=row, column=result_col)
+        cell.fill = RESULT_FILLS[result_value]
+        cell.font = RESULT_FONTS[result_value]
+        cell.alignment = Alignment(horizontal="center", vertical="center",
+                                   wrap_text=False)
 
 
 def ensure_workbook() -> None:
-    """Create ``results.xlsx`` with the Trials + Windows sheets if it
-    doesn't exist; otherwise upgrade missing header columns in place so
-    older files keep working when this script grows new metrics."""
-    if not RESULTS_XLSX.exists():
-        wb = Workbook()
-        trials = wb.active
-        trials.title = "Trials"
-        trials.append(TRIALS_HEADERS)
-        for col, w in enumerate(TRIALS_WIDTHS, start=1):
-            trials.column_dimensions[get_column_letter(col)].width = w
+    """Create ``results.xlsx`` if it doesn't exist. If an existing file
+    has different headers (older schema from a previous version of this
+    script), back it up to ``results.xlsx.bak`` and start fresh so the
+    new schema isn't silently misaligned with old rows."""
+    if RESULTS_XLSX.exists():
+        try:
+            wb = load_workbook(RESULTS_XLSX)
+            if "Trials" in wb.sheetnames:
+                trials = wb["Trials"]
+                existing = [
+                    trials.cell(row=1, column=i + 1).value
+                    for i in range(len(TRIALS_HEADERS))
+                ]
+                if existing != TRIALS_HEADERS:
+                    bak = RESULTS_XLSX.with_suffix(".xlsx.bak")
+                    print(
+                        f"NOTE: existing {RESULTS_XLSX.name} has an older "
+                        f"schema; backing up to {bak.name} and starting fresh."
+                    )
+                    if bak.exists():
+                        bak.unlink()
+                    RESULTS_XLSX.rename(bak)
+        except Exception:
+            pass
 
-        windows = wb.create_sheet("Windows")
-        windows.append(WINDOWS_HEADERS)
-        for col, w in enumerate(WINDOWS_WIDTHS, start=1):
-            windows.column_dimensions[get_column_letter(col)].width = w
-
+    if RESULTS_XLSX.exists():
+        # Headers match -- just re-apply formatting in case it was stripped.
+        wb = load_workbook(RESULTS_XLSX)
+        for s in ("Trials", "Windows"):
+            if s in wb.sheetnames:
+                _apply_header_style(wb[s])
         wb.save(RESULTS_XLSX)
         return
 
-    wb = load_workbook(RESULTS_XLSX)
-    changed = False
+    wb = Workbook()
+    trials = wb.active
+    trials.title = "Trials"
+    trials.append(TRIALS_HEADERS)
+    for col, w in enumerate(TRIALS_WIDTHS, start=1):
+        trials.column_dimensions[get_column_letter(col)].width = w
+    _apply_header_style(trials)
 
-    def upgrade(sheet: str, headers: List[str], widths: List[int]) -> None:
-        nonlocal changed
-        if sheet not in wb.sheetnames:
-            return
-        ws = wb[sheet]
-        for i, h in enumerate(headers, start=1):
-            if not ws.cell(row=1, column=i).value:
-                ws.cell(row=1, column=i, value=h)
-                changed = True
-        for col, w in enumerate(widths, start=1):
-            ws.column_dimensions[get_column_letter(col)].width = w
+    windows = wb.create_sheet("Windows")
+    windows.append(WINDOWS_HEADERS)
+    for col, w in enumerate(WINDOWS_WIDTHS, start=1):
+        windows.column_dimensions[get_column_letter(col)].width = w
+    _apply_header_style(windows)
 
-    upgrade("Trials", TRIALS_HEADERS, TRIALS_WIDTHS)
-    upgrade("Windows", WINDOWS_HEADERS, WINDOWS_WIDTHS)
-
-    if changed:
-        wb.save(RESULTS_XLSX)
+    wb.save(RESULTS_XLSX)
 
 
 def _thumb_for(src_dir: Path, name: str) -> Optional[Path]:
@@ -370,7 +492,8 @@ def append_trial(session_id: str, t: TrialResult) -> None:
 
     scenario_col = get_column_letter(TRIALS_HEADERS.index("scenario_photo") + 1)
     tag_col      = get_column_letter(TRIALS_HEADERS.index("tag_photo") + 1)
-    next_row = trials.max_row + 1
+    result_col   = TRIALS_HEADERS.index("result") + 1
+    next_row     = trials.max_row + 1
 
     trials.append([
         session_id,
@@ -378,22 +501,28 @@ def append_trial(session_id: str, t: TrialResult) -> None:
         t.scenario,
         t.power_mw,
         t.tag,
-        t.expected_antenna,
         t.start_time.strftime("%Y-%m-%d %H:%M:%S"),
         round(t.duration_s, 2),
         t.n_windows,
+        t.result,
         "yes" if t.verified else "no",
         t.ttv_s if t.ttv_s is not None else "",
-        ("yes" if t.within_deadline else "no") if t.verified else "no",
+        "yes" if t.within_deadline else "no",
+        t.winning_antenna if t.winning_antenna is not None else "",
+        t.n_hits_winner,
         t.cross_reads,
-        t.n_hits_correct_ant,
-        t.best_rssi_correct_ant if t.best_rssi_correct_ant is not None else "",
+        "yes" if t.clean else "no",
+        t.best_rssi_winner if t.best_rssi_winner is not None else "",
         ", ".join(t.detected_epcs),
         "",
         "",
         "",
     ])
     trials.row_dimensions[next_row].height = ROW_HEIGHT_PT
+
+    _style_data_row(trials, next_row, TRIALS_HEADERS,
+                    _CENTERED_TRIALS,
+                    result_col=result_col, result_value=t.result)
 
     s_thumb = _thumb_for(SCENARIOS_DIR, t.scenario)
     if s_thumb is not None:
@@ -421,6 +550,8 @@ def append_trial(session_id: str, t: TrialResult) -> None:
             "|".join(epc for epc, _ in w.ant1),
             "|".join(f"{r:.1f}" for _, r in w.ant1),
         ])
+        _style_data_row(windows, windows.max_row, WINDOWS_HEADERS,
+                        _CENTERED_WINDOWS)
 
     wb.save(RESULTS_XLSX)
 
@@ -441,7 +572,6 @@ def discover_tags() -> List[str]:
 def run_one_trial(scenario: str,
                   power_mw: int,
                   tag: str,
-                  expected_antenna: int,
                   trial_num: int) -> TrialResult:
     """Launch one ``rfid_gc_live`` subprocess for a single trial. The
     operator should be ready to slide the cup the moment the harness
@@ -475,7 +605,7 @@ def run_one_trial(scenario: str,
                 reader_ready.set()
                 print(
                     f"[Trial #{trial_num}] GO! Slide the {tag} cup over "
-                    f"antenna {expected_antenna} now ({TRIAL_DURATION_S:.1f} s)."
+                    f"either antenna now ({TRIAL_DURATION_S:.1f} s)."
                 )
                 sys.stdout.flush()
                 continue
@@ -492,9 +622,6 @@ def run_one_trial(scenario: str,
     t = threading.Thread(target=reader_thread, daemon=True)
     t.start()
 
-    # Wait for the reader to come up before starting the trial clock. If
-    # it never gets ready (e.g. USB unplugged) we abort after a generous
-    # timeout so the harness doesn't hang the operator.
     if not reader_ready.wait(timeout=15.0):
         print(f"[Trial #{trial_num}] ERROR: reader never became ready; "
               f"check USB / power and try again.")
@@ -502,11 +629,10 @@ def run_one_trial(scenario: str,
         t.join(timeout=2)
         return TrialResult(
             scenario=scenario, power_mw=power_mw, tag=tag,
-            expected_antenna=expected_antenna, trial_num=trial_num,
+            trial_num=trial_num,
             start_time=dt.datetime.now(), duration_s=0.0,
         )
 
-    # Let the C binary run for the trial budget, then stop it.
     time.sleep(TRIAL_DURATION_S)
     duration_s = time.perf_counter() - start_time_holder[0][1]
 
@@ -517,7 +643,6 @@ def run_one_trial(scenario: str,
         scenario=scenario,
         power_mw=power_mw,
         tag=tag,
-        expected_antenna=expected_antenna,
         trial_num=trial_num,
         start_time=start_time_holder[0][0],
         duration_s=duration_s,
@@ -553,14 +678,19 @@ def _pick(label: str, options: List[str]) -> int:
         print(f"  Invalid choice, try again.")
 
 
-def _pick_antenna() -> int:
+def _prompt_save() -> bool:
+    """Ask whether to keep this trial. ENTER (or 'y'/'yes') keeps it;
+    'n'/'no' discards. Repeats on anything else; Ctrl-C / EOF discards."""
     while True:
-        choice = input(
-            "\nWhich antenna will you slide the cup over? [0/1]: "
-        ).strip()
-        if choice in {"0", "1"}:
-            return int(choice)
-        print("  Must be 0 or 1.")
+        try:
+            ans = input("    Save this trial? [Y/n]: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            return False
+        if ans in {"", "y", "yes"}:
+            return True
+        if ans in {"n", "no"}:
+            return False
+        print("    Type 'y' (or ENTER) to save, 'n' to discard.")
 
 
 def main() -> int:
@@ -584,28 +714,27 @@ def main() -> int:
     print(f"Trial   : {TRIAL_DURATION_S:.1f} s  (verify deadline: "
           f"{VERIFY_DEADLINE_S:.1f} s)")
 
-    scenario_idx     = _pick("scenarios", SCENARIOS)
-    power_idx        = _pick("power levels (mW)", [str(p) for p in POWER_LEVELS_MW])
-    tag_idx          = _pick("tag types", tags_available)
-    expected_antenna = _pick_antenna()
+    scenario_idx = _pick("scenarios", SCENARIOS)
+    power_idx    = _pick("power levels (mW)", [str(p) for p in POWER_LEVELS_MW])
+    tag_idx      = _pick("tag types", tags_available)
 
-    # Per-(scenario, power, tag, antenna) trial counters so each unique
+    # Per-(scenario, power, tag) trial counters so each unique
     # combination has its own 1, 2, 3 sequence in the spreadsheet.
-    counters: Dict[Tuple[str, int, str, int], int] = {}
+    counters: Dict[Tuple[str, int, str], int] = {}
 
     try:
         while True:
             scenario = SCENARIOS[scenario_idx]
             power_mw = POWER_LEVELS_MW[power_idx]
             tag      = tags_available[tag_idx]
-            key      = (scenario, power_mw, tag, expected_antenna)
+            key      = (scenario, power_mw, tag)
 
             print(
-                f"\n[{scenario} | {power_mw} mW | {tag} | ant{expected_antenna}]"
+                f"\n[{scenario} | {power_mw} mW | {tag}]"
             )
             print(
                 "  ENTER = start trial   'p' = power   's' = scenario   "
-                "'t' = tag   'a' = antenna   'q' = quit"
+                "'t' = tag   'q' = quit"
             )
             try:
                 choice = input("> ").strip().lower()
@@ -626,43 +755,51 @@ def main() -> int:
             if choice == "t":
                 tag_idx = _pick("tag types", tags_available)
                 continue
-            if choice == "a":
-                expected_antenna = _pick_antenna()
+            if choice != "":
+                # Anything other than ENTER / known shortcut: re-prompt.
                 continue
 
-            counters[key] = counters.get(key, 0) + 1
+            tentative_num = counters.get(key, 0) + 1
             result = run_one_trial(
                 scenario=scenario,
                 power_mw=power_mw,
                 tag=tag,
-                expected_antenna=expected_antenna,
-                trial_num=counters[key],
+                trial_num=tentative_num,
             )
 
-            # Operator-readable verdict line. Use plain ASCII so it
-            # renders the same way on the Pi terminal and in CI logs.
+            # Single-line verdict, ASCII-only so it renders the same in
+            # all terminals / log files.
             if result.verified:
-                deadline = "OK" if result.within_deadline else "LATE"
+                win = result.winning_antenna
+                rssi = (f"{result.best_rssi_winner:.1f} dBm"
+                        if result.best_rssi_winner is not None else "?")
                 print(
-                    f"[Trial #{result.trial_num}] DONE -- verified in "
-                    f"{result.ttv_s:.2f} s [{deadline}], "
+                    f"[Trial #{tentative_num}] {result.result} -- "
+                    f"verified in {result.ttv_s:.2f} s, "
+                    f"winner ant{win} ({result.n_hits_winner}/{result.n_windows} windows), "
                     f"{result.cross_reads} cross-read(s), "
-                    f"{result.n_windows} window(s), "
-                    f"best RSSI {result.best_rssi_correct_ant} dBm"
+                    f"best RSSI {rssi}"
                 )
             else:
                 print(
-                    f"[Trial #{result.trial_num}] DONE -- NOT VERIFIED, "
-                    f"{result.cross_reads} cross-read(s), "
-                    f"{result.n_windows} window(s)"
+                    f"[Trial #{tentative_num}] {result.result} -- "
+                    f"no attribution in {result.n_windows} window(s)"
                 )
 
+            if not _prompt_save():
+                print("    discarded (not saved).")
+                continue
+
+            # Confirmed save -> commit the per-key counter and append.
+            counters[key] = tentative_num
             try:
                 append_trial(session_id, result)
                 print(f"    logged to {RESULTS_XLSX.name}")
             except Exception as exc:
                 print(f"    ERROR writing to {RESULTS_XLSX.name}: {exc}")
                 print("    (trial was NOT saved -- fix the issue and retry)")
+                # Roll the counter back so the next save reuses this num.
+                counters[key] = tentative_num - 1
     except KeyboardInterrupt:
         print("\nBye.")
         return 0

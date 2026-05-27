@@ -1,11 +1,16 @@
 # Beer-Pour RFID Verification Test
 
-Test harness for a **beer-pour-machine** where a tagged cup is slid over
-one of two antennas. For every cup-slide ("trial") the harness drives the
-arbitrated dual-antenna scanner (`rfid_gc_live`), measures how quickly the
-correct antenna verifies the tag, watches for any cross-reads on the other
-antenna, and appends one row to a master Excel workbook with the scenario
-and tag photos embedded next to it.
+Test harness for a **beer-pour-machine** where a tagged cup is slid over one
+of two antennas. For every cup-slide ("trial") the harness drives the
+arbitrated dual-antenna scanner (`rfid_gc_live`), records which antenna
+the arbitrator picked, how fast it picked, and whether the *other*
+antenna also saw the tag at any point during the slide -- the cross-read
+failure mode the arbitrator is designed to prevent.
+
+The operator does **not** declare which antenna the cup will be slid over.
+In real-world use the system has no advance knowledge of that -- a user
+can put their cup on either antenna -- so the test mirrors that: just
+slide the cup and let the system make the call.
 
 ## What the test measures
 
@@ -13,29 +18,40 @@ For each trial the harness records:
 
 | Metric                       | What it means                                                                       |
 |------------------------------|-------------------------------------------------------------------------------------|
-| `verified`                   | Did the expected antenna ever report a tag during the trial?                        |
-| `ttv_s`                      | Time to verification — seconds from "GO!" to the first window with a tag on that antenna. |
-| `within_3s`                  | `ttv_s <= 3.0` — the product-spec deadline.                                         |
-| `cross_reads`                | Number of decision windows that attributed any tag to the **other** antenna. With the arbitrator working as designed this should be `0`. Anything >0 is a false attribution to investigate. |
-| `n_hits_correct_ant`         | How many of the trial's windows saw a tag on the correct antenna (consistency).     |
-| `best_rssi_correct_ant_dbm`  | Strongest (closest-to-zero) RSSI on the correct antenna across the trial.           |
+| `result`                     | One-word verdict: **PASS** (verified ≤3 s, no cross-reads) / **SLOW** (verified + clean but >3 s) / **DIRTY** (verified but the other antenna also got hits) / **FAIL** (no attribution at all). |
+| `verified`                   | Did any antenna ever report a tag during the trial?                                 |
+| `ttv_s`                      | Time to verification — seconds from "GO!" to the first window with any attribution. |
+| `within_3s`                  | `ttv_s ≤ 3.0` — the product-spec deadline.                                         |
+| `winning_antenna`            | `0` or `1` — the antenna with the most attributed windows (= system's answer).      |
+| `n_hits_winner`              | How many of the trial's windows attributed to the winning antenna (consistency).    |
+| `cross_reads`                | Windows that attributed any tag to the OTHER antenna. **0 means the arbitrator held one consistent decision**; anything >0 means it flip-flopped, which is what the per-window dominance rule is meant to prevent. |
+| `clean`                      | `yes` iff `cross_reads == 0`.                                                       |
+| `best_rssi_winner_dbm`       | Strongest (closest-to-zero) RSSI on the winning antenna across the trial.           |
 | `detected_epcs`              | Every distinct EPC seen during the trial, regardless of antenna.                    |
 
 Each trial also stores the full per-window trace in a second sheet
-(`Windows`) so you can drill in: see exactly which antenna saw what at
-each 1-second window.
+(`Windows`) so you can drill in: see exactly which antenna got which
+EPC at every 1-second decision window.
 
 ## Test axes
 
-The four axes are selected from menus and persist across trials until you
-change them with `p` / `s` / `t` / `a`.
+The three axes are selected from menus and persist across trials until
+you change them with `p` / `s` / `t`. The test does **not** ask which
+antenna the cup will be slid over -- the harness derives the winner
+from the data.
 
 | Axis              | Values                                                                       |
 |-------------------|------------------------------------------------------------------------------|
 | Scenario          | `drip_tray_empty_cup_empty`, `drip_tray_half_full_cup_empty` (editable in `SCENARIOS` in `beer_pour_logger.py`) |
 | Power (mW)        | `30`, `175`, `316` (editable in `POWER_LEVELS_MW`)                            |
 | Tag type          | Auto-discovered from `images/tags/*.png`. Drop e.g. `images/tags/foam.png` to register a new tag. |
-| Expected antenna  | `0` (Source_0) or `1` (Source_1) — which antenna you'll slide the cup over.   |
+
+After every trial the harness prints a verdict line and asks
+**`Save this trial? [Y/n]`** — press ENTER (or `y`) to append the row,
+`n` to discard it. The per-`(scenario, power, tag)` trial counter only
+advances when you choose to save, so the spreadsheet stays sequential
+even if you re-do a trial that didn't go well (e.g. you slid the cup
+too slowly).
 
 ## Files
 
@@ -48,7 +64,7 @@ change them with `p` / `s` / `t` / `a`.
 | `run_gc.sh`                | Compile-and-run wrapper for `rfid_gc_live` (interactive use, no logging). |
 | `run_standard.sh`          | Compile-and-run wrapper for `rfid_standard`. |
 | `run_test.sh`              | **One-shot test runner.** Checks SRC, fixes USB perms, compiles `rfid_gc_live`, launches the Python logger. Preferred entry point for a test session. |
-| `beer_pour_logger.py`      | Python test harness. Drives `rfid_gc_live` one trial at a time, captures every window, computes the metrics above, appends to `results.xlsx`. |
+| `beer_pour_logger.py`      | Python test harness. Drives `rfid_gc_live` one trial at a time, captures every window, computes the metrics above, appends to `results.xlsx` (with operator confirmation). |
 | `requirements.txt`         | Python deps for the logger: `openpyxl`, `Pillow`. |
 | `images/scenarios/`        | Optional photos of each scenario — embedded next to the trial row when present. |
 | `images/tags/`             | Photos of each tag type. **The filename (without `.png`) is the tag name** that shows up in the menu. |
@@ -116,29 +132,37 @@ Available tag types:
   1. foam
 Select tag types [1..1]: 1
 
-Which antenna will you slide the cup over? [0/1]: 0
-
-[drip_tray_empty_cup_empty | 30 mW | foam | ant0]
-  ENTER = start trial   'p' = power   's' = scenario   't' = tag   'a' = antenna   'q' = quit
+[drip_tray_empty_cup_empty | 30 mW | foam]
+  ENTER = start trial   'p' = power   's' = scenario   't' = tag   'q' = quit
 > <ENTER>
 
 [Trial #1] Launching reader at 30 mW... (reader takes ~1-2 s to come up)
     ===== Dual-Antenna RFID Live Scanner (arbitrated) =====
     [GC] Reader: R3100C  Serial: ...
     [GC] Ready. Empty sweeps print []. Tagged sweeps prepend [TX …]. Ctrl+C to stop.
-[Trial #1] GO! Slide the foam cup over antenna 0 now (5.0 s).
+[Trial #1] GO! Slide the foam cup over either antenna now (5.0 s).
     [TX=30 mW] [(0)(-58.3) E2801160600002054E1A1234,                                      ]
     [TX=30 mW] [(0)(-58.4) E2801160600002054E1A1234,                                      ]
     [TX=30 mW] [(0)(-58.5) E2801160600002054E1A1234,                                      ]
     []
     [TX=30 mW] [(0)(-58.6) E2801160600002054E1A1234,                                      ]
-[Trial #1] DONE -- verified in 1.00 s [OK], 0 cross-read(s), 5 window(s), best RSSI -58.3 dBm
+[Trial #1] PASS -- verified in 1.00 s, winner ant0 (4/5 windows), 0 cross-read(s), best RSSI -58.3 dBm
+    Save this trial? [Y/n]: <ENTER>
     logged to results.xlsx
 ```
 
 The reader's sweep lines are forwarded verbatim to your terminal (same
 ANSI-coloured output as running `rfid_gc_live` by hand), and at the end
 the harness prints a single-line verdict.
+
+### Verdict short-codes
+
+| Verdict   | Meaning |
+|-----------|---------|
+| **PASS**  | `verified == yes`, `within_3s == yes`, `cross_reads == 0`. The happy path. |
+| **SLOW**  | Verified + clean, but `ttv_s > 3.0`. The arbitrator got it right but missed the 3-second deadline (e.g. the operator hadn't actually placed the cup yet). |
+| **DIRTY** | Verified, but the other antenna also got attributed at some point. Investigate: physical alignment / arbitration thresholds. |
+| **FAIL**  | No attribution at all in the trial. |
 
 Press `'q'` (or Ctrl-C) at the menu to end the session.
 
@@ -155,27 +179,35 @@ know when to slide.
 ## Reading the spreadsheet
 
 `results.xlsx` is created automatically on the first trial and appended
-to thereafter. Two sheets:
+to thereafter. The header row is frozen, the verdict (`result`) is
+colour-coded for at-a-glance scanning, and the photos are embedded as
+thumbnails next to each row.
+
+If a previous version of this script left a `results.xlsx` with a
+different column layout, the harness automatically backs it up to
+`results.xlsx.bak` and starts a fresh file with the new schema.
 
 ### Sheet `Trials` — one row per trial
 
 | Column                       | Description |
 |------------------------------|-------------|
 | `session_id`                 | Timestamp of the session (e.g. `20260527-143200`). |
-| `trial_num`                  | 1-based counter, **independent per (scenario, power, tag, antenna) combination**. |
+| `trial_num`                  | 1-based counter, **independent per (scenario, power, tag) combination**. Only advances when you confirm-save the trial. |
 | `scenario`                   | Name from `SCENARIOS`. |
 | `power_mw`                   | TX power for this trial. |
 | `tag`                        | Tag-name (file in `images/tags/`). |
-| `expected_antenna`           | `0` or `1`. |
 | `start_time`                 | Wall-clock at "GO!". |
 | `duration_s`                 | Actual elapsed time of the trial. |
-| `n_windows`                  | Number of 1-second windows the C binary emitted during the trial. |
-| `verified`                   | `yes` / `no` — did the expected antenna ever attribute a tag? |
+| `n_windows`                  | Number of 1-second decision windows the C binary emitted during the trial. |
+| `result`                     | PASS / SLOW / DIRTY / FAIL (colour-coded). |
+| `verified`                   | `yes` / `no`. |
 | `ttv_s`                      | Time to verification (s). Blank if not verified. |
-| `within_3s`                  | `yes` / `no` — did `ttv_s <= 3.0`? |
-| `cross_reads`                | Windows that attributed any tag to the other antenna. |
-| `n_hits_correct_ant`         | Windows that attributed to the expected antenna. |
-| `best_rssi_correct_ant_dbm`  | Strongest RSSI on the expected antenna across the trial. |
+| `within_3s`                  | `yes` / `no`. |
+| `winning_antenna`            | `0` / `1` / blank. |
+| `n_hits_winner`              | Windows that attributed to the winning antenna. |
+| `cross_reads`                | Windows that attributed to the OTHER antenna. |
+| `clean`                      | `yes` iff `cross_reads == 0`. |
+| `best_rssi_winner_dbm`       | Strongest RSSI on the winning antenna across the trial. |
 | `detected_epcs`              | All unique EPCs detected, comma-separated. |
 | `notes`                      | Free-text — type here in Excel after a trial. |
 | `scenario_photo`             | Embedded thumbnail of `images/scenarios/<scenario>.png` (if present). |
@@ -210,6 +242,6 @@ to thereafter. Two sheets:
 - **`'rfid_gc_live' not found or not executable`** — run `./compile_gc.sh` (or just `./run_test.sh`).
 - **`ModuleNotFoundError: openpyxl`** — `sudo apt install -y python3-openpyxl python3-pil` (or `pip3 install --break-system-packages -r requirements.txt`).
 - **`Could not connect (code …)`** — check USB, then `sudo chmod 666 /dev/ttyACM0` (or add yourself to `dialout` group and re-login).
-- **All trials show `NOT VERIFIED`** — make sure you're sliding the cup quickly after the `GO!` prompt; the trial clock starts when `[GC] Ready` appears.
-- **`cross_reads > 0` on every trial** — the arbitrator is letting the opposite antenna through. Likely cause: a tag is sitting roughly equidistant between both antennas, or `GC_RSSI_MARGIN_DB10` in `rfid_gc_live.c` is too low for your physical layout.
+- **All trials show `FAIL`** — make sure you're sliding the cup quickly after the `GO!` prompt; the trial clock starts when `[GC] Ready` appears.
+- **Lots of `DIRTY` results** — the arbitrator is letting the opposite antenna through. Likely cause: a tag is sitting roughly equidistant between both antennas, or `GC_RSSI_MARGIN_DB10` in `rfid_gc_live.c` is too low for your physical layout.
 - **`results.xlsx` write fails** — Excel locks the file when it's open. Close it and retry the trial.
