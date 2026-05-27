@@ -15,23 +15,26 @@ decision window, and at every window boundary emits one line on stdout:
 The harness does NOT ask the operator which antenna the cup is going to be
 slid over -- in real-world use the system has no advance knowledge of that.
 Instead it lets the arbitrator make the call and then characterises the
-quality of that call:
+quality of that call. The results spreadsheet is intentionally compact;
+each trial is one row with these columns:
 
-- ``winning_antenna``  the antenna with the most attributions across the
-                       trial (i.e. the system's "answer")
-- ``cross_reads``      number of EPCs that appeared on more than one
-                       antenna during the trial (true leakage / flip-flop
-                       of the *same* tag). Two different tags, each on
-                       its own antenna, does NOT count as a cross-read.
-- ``cross_read_epcs``  comma-separated list of those leaking EPCs (blank
-                       when clean).
-- ``ttv_s``            seconds from "GO!" to the first window that
-                       attributed anything (= time-to-verification)
-- ``within_3s``        ``ttv_s <= 3.0`` (the product spec deadline)
-- ``result``           PASS / SLOW / DIRTY / FAIL one-word verdict
+- ``session_id``           timestamp of the test session
+- ``scenario``             physical setup under test
+- ``power_mw``             TX power used
+- ``swap_rate_3s_hz``      antenna swaps per second within the first 3 s
+                           (a low-noise call gives 0.0)
+- ``winning_antenna``      per-EPC home antenna, e.g. ``6E6F76 -> ant0``
+- ``cross_reads``          number of EPCs seen on BOTH antennas (same-tag
+                           leakage; 0 is the happy path)
+- ``best_rssi_winner_dbm`` strongest RSSI on the winning antenna
+- ``detected_epcs``        every distinct EPC seen during the trial
+- ``tag_photo``            embedded thumbnail of the tag used
+- ``result``               PASS / SLOW / DIRTY / FAIL one-word verdict
+- ``notes``                operator comment entered after the trial
 
 After every trial the operator is asked whether to keep that row -- press
-ENTER (or 'y') to append, 'n' to discard.
+ENTER (or 'y') to append, 'n' to discard -- and then optionally enter a
+free-text comment that goes into ``notes``.
 
 Usage::
 
@@ -246,6 +249,55 @@ class TrialResult:
         return 0 if n0 >= n1 else 1
 
     @property
+    def winning_antenna_per_tag(self) -> str:
+        """Human-readable summary of which antenna each detected EPC was
+        attributed to most often during the trial. With two cups present
+        you get e.g. ``"6E6F76 -> ant0, 6E6FD6 -> ant1"`` (only the last
+        6 hex chars of the EPC are shown to keep the cell compact). With
+        a single EPC you get ``"<last6> -> antN"``. Returns an empty
+        string when no EPC was attributed."""
+        homes = self.epc_home_antennas
+        if not homes:
+            return ""
+        return ", ".join(
+            f"{epc[-6:]} -> ant{ant}"
+            for epc, ant in sorted(homes.items())
+        )
+
+    @property
+    def swap_rate_3s_hz(self) -> float:
+        """Per-EPC antenna swaps observed within the first
+        VERIFY_DEADLINE_S seconds of the trial, expressed as swaps per
+        second. A swap = the same EPC was attributed to one antenna in
+        one window and the other antenna in the next window where that
+        EPC appeared. Stable attribution (cup sitting on one antenna)
+        gives 0.0; constant flip-flopping rises with frequency. A useful
+        single-number measure of how 'noisy' the arbitrator's answer
+        was during the verification window."""
+        windows = [w for w in self.windows if w.t_offset_s <= VERIFY_DEADLINE_S]
+        if not windows or VERIFY_DEADLINE_S <= 0:
+            return 0.0
+        # Per EPC, build a time series of "which antenna this window
+        # thinks it lives on". When an EPC appears on BOTH antennas in
+        # the same window we pick the one with the stronger RSSI so the
+        # series remains a clean sequence of 0/1 values.
+        series: Dict[str, List[int]] = {}
+        for w in windows:
+            per_epc: Dict[str, Tuple[int, float]] = {}
+            for ant, tags in ((0, w.ant0), (1, w.ant1)):
+                for epc, rssi in tags:
+                    if epc not in per_epc or rssi > per_epc[epc][1]:
+                        per_epc[epc] = (ant, rssi)
+            for epc, (ant, _) in per_epc.items():
+                series.setdefault(epc, []).append(ant)
+        total_swaps = 0
+        for ants in series.values():
+            for i in range(1, len(ants)):
+                if ants[i] != ants[i - 1]:
+                    total_swaps += 1
+        return round(total_swaps / VERIFY_DEADLINE_S, 2)
+
+    @property
     def ttv_s(self) -> Optional[float]:
         """Time (since trial start) of the first window that put any tag
         on any antenna. ``None`` if it never happened."""
@@ -325,121 +377,128 @@ class TrialResult:
 # ─────────────────────────── workbook I/O ───────────────────────────
 
 
+# The trial sheet exposes a deliberately small, operator-focused column
+# set. Order here is the order they appear in the spreadsheet.
 TRIALS_HEADERS: List[str] = [
     "session_id",
-    "trial_num",
     "scenario",
     "power_mw",
-    "tag",
-    "start_time",
-    "duration_s",
-    "n_windows",
-    "result",
-    "verified",
-    "ttv_s",
-    f"within_{int(VERIFY_DEADLINE_S)}s",
+    "swap_rate_3s_hz",
     "winning_antenna",
-    "n_hits_winner",
     "cross_reads",
-    "cross_read_epcs",
-    "clean",
     "best_rssi_winner_dbm",
     "detected_epcs",
-    "notes",
-    "scenario_photo",
     "tag_photo",
+    "result",
+    "notes",
 ]
 
+# Column widths in Excel character units, paired by index with the
+# headers list above.
 TRIALS_WIDTHS: List[int] = [
-    16, 10, 32, 9, 14, 22, 11, 11, 9, 10, 9,
-    11, 17, 14, 12, 36, 8, 21, 60, 30, 22, 16,
+    18,   # session_id
+    34,   # scenario
+    11,   # power_mw
+    16,   # swap_rate_3s_hz
+    28,   # winning_antenna
+    13,   # cross_reads
+    20,   # best_rssi_winner_dbm
+    54,   # detected_epcs
+    22,   # tag_photo
+    12,   # result
+    36,   # notes
 ]
 
-WINDOWS_HEADERS: List[str] = [
-    "session_id",
-    "trial_num",
-    "scenario",
-    "power_mw",
-    "tag",
-    "window_idx",
-    "t_offset_s",
-    "ant0_epcs",
-    "ant0_rssis_dbm",
-    "ant1_epcs",
-    "ant1_rssis_dbm",
-]
-
-WINDOWS_WIDTHS: List[int] = [16, 10, 32, 9, 14, 11, 11, 36, 24, 36, 24]
-
-
-# Columns whose values are best displayed centred (counts, numbers, flags).
+# Columns rendered with a centred alignment (counts / scalars). Everything
+# else is left-aligned with wrapping.
 _CENTERED_TRIALS = {
-    "trial_num", "power_mw", "duration_s", "n_windows",
-    "result", "verified", "ttv_s",
-    f"within_{int(VERIFY_DEADLINE_S)}s",
-    "winning_antenna", "n_hits_winner", "cross_reads", "cross_read_epcs", "clean",
-    "best_rssi_winner_dbm",
-}
-_CENTERED_WINDOWS = {
-    "trial_num", "power_mw", "window_idx", "t_offset_s",
+    "power_mw", "swap_rate_3s_hz", "cross_reads",
+    "best_rssi_winner_dbm", "result",
 }
 
-# Result-column colour coding. Light fills + readable dark fonts so the
-# verdict is visible at a glance when scanning the sheet.
+
+# ────────────────────────── visual palette ──────────────────────────
+#
+# A sober, modern palette inspired by editorial dashboards: dark navy
+# header, off-white striping for legibility, pill-style verdict cells.
+# All colours are kept very close to neutral so the spreadsheet doesn't
+# scream when projected on a meeting room screen.
+
+FONT_FAMILY     = "Calibri"
+TEXT_COLOR      = "1F2937"   # near-black with a hint of warmth
+MUTED_TEXT      = "475569"
+HEADER_BG       = "0F172A"   # very dark slate / navy
+HEADER_FG       = "FFFFFF"
+STRIPE_EVEN_BG  = "FFFFFF"
+STRIPE_ODD_BG   = "F8FAFC"
+GRID_COLOR      = "E5E7EB"
+
+# Soft pastel pill colours for the verdict column. Light fill + a
+# saturated dark text colour keeps them legible at small sizes.
 RESULT_FILLS = {
-    "PASS":  PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
-    "SLOW":  PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
-    "DIRTY": PatternFill(start_color="FFD9B3", end_color="FFD9B3", fill_type="solid"),
-    "FAIL":  PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
+    "PASS":  PatternFill(start_color="D1FAE5", end_color="D1FAE5", fill_type="solid"),
+    "SLOW":  PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid"),
+    "DIRTY": PatternFill(start_color="FFEDD5", end_color="FFEDD5", fill_type="solid"),
+    "FAIL":  PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid"),
 }
 RESULT_FONTS = {
-    "PASS":  Font(bold=True, color="006100"),
-    "SLOW":  Font(bold=True, color="9C5700"),
-    "DIRTY": Font(bold=True, color="9C5700"),
-    "FAIL":  Font(bold=True, color="9C0006"),
+    "PASS":  Font(name=FONT_FAMILY, bold=True, color="065F46", size=11),
+    "SLOW":  Font(name=FONT_FAMILY, bold=True, color="92400E", size=11),
+    "DIRTY": Font(name=FONT_FAMILY, bold=True, color="9A3412", size=11),
+    "FAIL":  Font(name=FONT_FAMILY, bold=True, color="991B1B", size=11),
 }
 
 
 def _apply_header_style(ws: Any) -> None:
-    """Bold white text on a dark-blue fill, centred, wrapped, with a
-    1-pixel border. Also freezes the header row so it stays visible
-    when scrolling."""
-    header_font = Font(bold=True, color="FFFFFF", size=11)
-    header_fill = PatternFill(start_color="305496", end_color="305496",
+    """Style the header row: bold white-on-navy, centred, wrapped, with
+    a hairline bottom border. Also freezes the header row so it stays
+    visible when scrolling, and disables Excel's gridlines so the
+    custom striping reads cleanly."""
+    header_font = Font(name=FONT_FAMILY, bold=True, color=HEADER_FG, size=11)
+    header_fill = PatternFill(start_color=HEADER_BG, end_color=HEADER_BG,
                               fill_type="solid")
     header_align = Alignment(horizontal="center", vertical="center",
                              wrap_text=True)
-    thin_border = Border(
-        left=Side(style="thin", color="BFBFBF"),
-        right=Side(style="thin", color="BFBFBF"),
-        top=Side(style="thin", color="BFBFBF"),
-        bottom=Side(style="thin", color="BFBFBF"),
-    )
+    bottom_border = Border(bottom=Side(style="thin", color=HEADER_BG))
     for cell in ws[1]:
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = header_align
-        cell.border = thin_border
-    ws.row_dimensions[1].height = 30
+        cell.border = bottom_border
+    ws.row_dimensions[1].height = 34
     ws.freeze_panes = "A2"
+    # Hide native gridlines so our striped rows + soft separators look
+    # intentional. openpyxl's API on newer versions is sheet_view.showGridLines.
+    try:
+        ws.sheet_view.showGridLines = False
+    except Exception:
+        pass
 
 
 def _style_data_row(ws: Any, row: int, headers: List[str],
                     centered_cols: set, result_col: Optional[int] = None,
                     result_value: Optional[str] = None) -> None:
-    thin_border = Border(
-        left=Side(style="thin", color="E0E0E0"),
-        right=Side(style="thin", color="E0E0E0"),
-        top=Side(style="thin", color="E0E0E0"),
-        bottom=Side(style="thin", color="E0E0E0"),
+    """Apply the full body-row look: alternating stripe fill, hairline
+    horizontal separators only (no busy vertical lines), Calibri 10 in
+    near-black, centred or wrapped-left alignment depending on the
+    column, and a pill-style fill+colour on the ``result`` cell if any."""
+    stripe_fill = PatternFill(
+        start_color=STRIPE_ODD_BG if (row % 2 == 0) else STRIPE_EVEN_BG,
+        end_color  =STRIPE_ODD_BG if (row % 2 == 0) else STRIPE_EVEN_BG,
+        fill_type="solid",
     )
-    centered = Alignment(horizontal="center", vertical="center")
-    left     = Alignment(horizontal="left",   vertical="center",
+    body_font = Font(name=FONT_FAMILY, size=10, color=TEXT_COLOR)
+    body_border = Border(bottom=Side(style="hair", color=GRID_COLOR))
+    centered = Alignment(horizontal="center", vertical="center",
                          wrap_text=True)
+    left     = Alignment(horizontal="left",   vertical="center",
+                         wrap_text=True, indent=1)
 
     for col_idx, name in enumerate(headers, start=1):
         cell = ws.cell(row=row, column=col_idx)
-        cell.border = thin_border
+        cell.font = body_font
+        cell.fill = stripe_fill
+        cell.border = body_border
         cell.alignment = centered if name in centered_cols else left
 
     if result_col is not None and result_value in RESULT_FILLS:
@@ -463,62 +522,62 @@ def _sheet_headers(ws: Any) -> List[str]:
     return [str(h) for h in headers]
 
 
-def _ensure_sheet(wb: Workbook, sheet_name: str,
-                  canonical_headers: List[str],
-                  widths: List[int]) -> List[str]:
-    """Create the sheet if missing, or extend it with any new columns
-    that have been added to the canonical header list since the file
-    was created. Returns the list of headers as they appear in the
-    sheet right now (in file order, possibly with extra columns at
-    the end that newer canonical schemas know about)."""
-    if sheet_name not in wb.sheetnames:
-        ws = wb.create_sheet(sheet_name)
-        ws.append(canonical_headers)
-        for col, w in enumerate(widths, start=1):
-            ws.column_dimensions[get_column_letter(col)].width = w
-        _apply_header_style(ws)
-        return list(canonical_headers)
-
-    ws = wb[sheet_name]
-    existing = _sheet_headers(ws)
-    existing_set = set(existing)
-    next_col = len(existing) + 1
-    for h in canonical_headers:
-        if h not in existing_set:
-            ws.cell(row=1, column=next_col, value=h)
-            existing.append(h)
-            existing_set.add(h)
-            next_col += 1
-    # Reasonable widths: pick the canonical width when we know it,
-    # otherwise leave the column alone.
-    width_by_name = dict(zip(canonical_headers, widths))
-    for idx, name in enumerate(existing, start=1):
-        if name in width_by_name:
-            ws.column_dimensions[get_column_letter(idx)].width = width_by_name[name]
-    _apply_header_style(ws)
-    return existing
+def _create_fresh_workbook() -> None:
+    """Write a brand-new ``results.xlsx`` with the current schema and
+    the styled header row applied."""
+    wb = Workbook()
+    default = wb.active
+    wb.remove(default)
+    trials = wb.create_sheet("Trials")
+    trials.append(TRIALS_HEADERS)
+    for col, w in enumerate(TRIALS_WIDTHS, start=1):
+        trials.column_dimensions[get_column_letter(col)].width = w
+    _apply_header_style(trials)
+    wb.save(RESULTS_XLSX)
 
 
 def ensure_workbook() -> None:
-    """Create ``results.xlsx`` if it doesn't exist, otherwise extend any
-    sheets in-place to accommodate new columns the canonical schema knows
-    about. Existing rows are preserved across upgrades -- new columns
-    show up at the right of older rows with blank cells."""
+    """Make sure ``results.xlsx`` exists with the current column schema.
+
+    Schema policy:
+    - File missing -> create a fresh one.
+    - File present and headers match the current schema exactly ->
+      re-apply header styling (in case it was stripped) and return.
+    - File present but headers don't match -> archive the old file to
+      ``results_archive_<timestamp>.xlsx`` and start a fresh file with
+      the current schema. Old data is preserved alongside, just not
+      mingled with the new layout.
+    """
     if not RESULTS_XLSX.exists():
-        wb = Workbook()
-        # Workbook() starts with an unnamed sheet; we discard it and let
-        # _ensure_sheet create the named sheets cleanly.
-        default = wb.active
-        wb.remove(default)
-        _ensure_sheet(wb, "Trials",  TRIALS_HEADERS,  TRIALS_WIDTHS)
-        _ensure_sheet(wb, "Windows", WINDOWS_HEADERS, WINDOWS_WIDTHS)
+        _create_fresh_workbook()
+        return
+
+    try:
+        wb = load_workbook(RESULTS_XLSX)
+    except Exception as exc:
+        print(f"NOTE: could not open existing {RESULTS_XLSX.name} ({exc}); "
+              f"creating a fresh workbook.")
+        _create_fresh_workbook()
+        return
+
+    headers_ok = (
+        "Trials" in wb.sheetnames
+        and _sheet_headers(wb["Trials"]) == TRIALS_HEADERS
+    )
+
+    if headers_ok:
+        _apply_header_style(wb["Trials"])
         wb.save(RESULTS_XLSX)
         return
 
-    wb = load_workbook(RESULTS_XLSX)
-    _ensure_sheet(wb, "Trials",  TRIALS_HEADERS,  TRIALS_WIDTHS)
-    _ensure_sheet(wb, "Windows", WINDOWS_HEADERS, WINDOWS_WIDTHS)
-    wb.save(RESULTS_XLSX)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    archive = RESULTS_XLSX.with_name(f"results_archive_{stamp}.xlsx")
+    print(
+        f"NOTE: {RESULTS_XLSX.name} has an older column layout; "
+        f"archiving it to {archive.name} and starting a fresh sheet."
+    )
+    RESULTS_XLSX.rename(archive)
+    _create_fresh_workbook()
 
 
 def _thumb_for(src_dir: Path, name: str) -> Optional[Path]:
@@ -551,79 +610,62 @@ def _write_row_by_header(ws: Any, row: int, values: Dict[str, Any]) -> None:
             ws.cell(row=row, column=col, value=val)
 
 
+def _write_row_by_header(ws: Any, row: int,
+                         headers: List[str],
+                         values: Dict[str, Any]) -> None:
+    """Write ``values`` to ``row`` using ``headers`` (read from the
+    sheet's header row) to decide which column each key goes in. Keys
+    that aren't in the header row are silently ignored; columns that
+    aren't in ``values`` are left blank."""
+    for key, val in values.items():
+        if key in headers:
+            col = headers.index(key) + 1
+            ws.cell(row=row, column=col, value=val)
+
+
 def append_trial(session_id: str, t: TrialResult, comment: str = "") -> None:
+    """Append one trial as a single row to ``results.xlsx``. Empty rows
+    are not written; every call adds exactly one new row regardless of
+    how many windows were in the trial. The tag photo (when present in
+    ``images/tags/<tag>.png``) is embedded in the row's ``tag_photo``
+    column."""
     wb = load_workbook(RESULTS_XLSX)
     trials = wb["Trials"]
-    windows = wb["Windows"]
-
-    trial_headers  = _sheet_headers(trials)
-    window_headers = _sheet_headers(windows)
+    trial_headers = _sheet_headers(trials)
 
     next_row = trials.max_row + 1
-    trial_row = {
-        "session_id":            session_id,
-        "trial_num":             t.trial_num,
-        "scenario":              t.scenario,
-        "power_mw":              t.power_mw,
-        "tag":                   t.tag,
-        "start_time":            t.start_time.strftime("%Y-%m-%d %H:%M:%S"),
-        "duration_s":            round(t.duration_s, 2),
-        "n_windows":             t.n_windows,
-        "result":                t.result,
-        "verified":              "yes" if t.verified else "no",
-        "ttv_s":                 t.ttv_s if t.ttv_s is not None else "",
-        f"within_{int(VERIFY_DEADLINE_S)}s": "yes" if t.within_deadline else "no",
-        "winning_antenna":       t.winning_antenna if t.winning_antenna is not None else "",
-        "n_hits_winner":         t.n_hits_winner,
-        "cross_reads":           t.cross_reads,
-        "cross_read_epcs":       ", ".join(t.cross_read_epcs),
-        "clean":                 "yes" if t.clean else "no",
-        "best_rssi_winner_dbm":  t.best_rssi_winner if t.best_rssi_winner is not None else "",
-        "detected_epcs":         ", ".join(t.detected_epcs),
-        "notes":                 comment,
+
+    trial_row: Dict[str, Any] = {
+        "session_id":           session_id,
+        "scenario":             t.scenario,
+        "power_mw":             t.power_mw,
+        "swap_rate_3s_hz":      t.swap_rate_3s_hz,
+        "winning_antenna":      t.winning_antenna_per_tag,
+        "cross_reads":          t.cross_reads,
+        "best_rssi_winner_dbm": t.best_rssi_winner
+                                if t.best_rssi_winner is not None else "",
+        "detected_epcs":        ", ".join(t.detected_epcs),
+        "tag_photo":            "",
+        "result":               t.result,
+        "notes":                comment,
     }
-    _write_row_by_header(trials, next_row, trial_row)
+    _write_row_by_header(trials, next_row, trial_headers, trial_row)
     trials.row_dimensions[next_row].height = ROW_HEIGHT_PT
 
-    result_col = trial_headers.index("result") + 1 if "result" in trial_headers else None
+    result_col = (trial_headers.index("result") + 1
+                  if "result" in trial_headers else None)
     _style_data_row(trials, next_row, trial_headers,
                     _CENTERED_TRIALS,
                     result_col=result_col, result_value=t.result)
 
-    if "scenario_photo" in trial_headers:
-        s_thumb = _thumb_for(SCENARIOS_DIR, t.scenario)
-        if s_thumb is not None:
-            col_letter = get_column_letter(trial_headers.index("scenario_photo") + 1)
-            img = XLImage(str(s_thumb))
-            img.anchor = f"{col_letter}{next_row}"
-            trials.add_image(img)
-
+    # Embed the tag photo thumbnail in the row's tag_photo column.
     if "tag_photo" in trial_headers:
-        t_thumb = _thumb_for(TAGS_DIR, t.tag)
-        if t_thumb is not None:
+        thumb = _thumb_for(TAGS_DIR, t.tag)
+        if thumb is not None:
             col_letter = get_column_letter(trial_headers.index("tag_photo") + 1)
-            img = XLImage(str(t_thumb))
+            img = XLImage(str(thumb))
             img.anchor = f"{col_letter}{next_row}"
             trials.add_image(img)
-
-    for w in t.windows:
-        next_w_row = windows.max_row + 1
-        window_row = {
-            "session_id":      session_id,
-            "trial_num":       t.trial_num,
-            "scenario":        t.scenario,
-            "power_mw":        t.power_mw,
-            "tag":             t.tag,
-            "window_idx":      w.idx,
-            "t_offset_s":      round(w.t_offset_s, 3),
-            "ant0_epcs":       "|".join(epc for epc, _ in w.ant0),
-            "ant0_rssis_dbm":  "|".join(f"{r:.1f}" for _, r in w.ant0),
-            "ant1_epcs":       "|".join(epc for epc, _ in w.ant1),
-            "ant1_rssis_dbm":  "|".join(f"{r:.1f}" for _, r in w.ant1),
-        }
-        _write_row_by_header(windows, next_w_row, window_row)
-        _style_data_row(windows, next_w_row, window_headers,
-                        _CENTERED_WINDOWS)
 
     wb.save(RESULTS_XLSX)
 
@@ -854,13 +896,9 @@ def main() -> int:
             # Single-line verdict, ASCII-only so it renders the same in
             # all terminals / log files.
             if result.verified:
-                win = result.winning_antenna
                 rssi = (f"{result.best_rssi_winner:.1f} dBm"
                         if result.best_rssi_winner is not None else "?")
-                homes = ", ".join(
-                    f"{epc[-6:]}->ant{ant}"
-                    for epc, ant in sorted(result.epc_home_antennas.items())
-                )
+                homes = result.winning_antenna_per_tag or "(none)"
                 cross_msg = (
                     f"{result.cross_reads} leaking EPC(s): "
                     f"{', '.join(result.cross_read_epcs)}"
@@ -871,6 +909,7 @@ def main() -> int:
                     f"[Trial #{tentative_num}] {result.result} -- "
                     f"verified in {result.ttv_s:.2f} s, "
                     f"homes [{homes}], "
+                    f"swap rate {result.swap_rate_3s_hz:.2f} Hz, "
                     f"{cross_msg}, "
                     f"best RSSI {rssi}"
                 )

@@ -14,25 +14,21 @@ slide the cup and let the system make the call.
 
 ## What the test measures
 
-For each trial the harness records:
+Each trial is **one row** in `results.xlsx` with these columns (in order):
 
-| Metric                       | What it means                                                                       |
+| Column                       | What it means                                                                       |
 |------------------------------|-------------------------------------------------------------------------------------|
-| `result`                     | One-word verdict: **PASS** (verified ≤3 s, no cross-reads) / **SLOW** (verified + clean but >3 s) / **DIRTY** (verified but the other antenna also got hits) / **FAIL** (no attribution at all). |
-| `verified`                   | Did any antenna ever report a tag during the trial?                                 |
-| `ttv_s`                      | Time to verification — seconds from "GO!" to the first window with any attribution. |
-| `within_3s`                  | `ttv_s ≤ 3.0` — the product-spec deadline.                                         |
-| `winning_antenna`            | `0` or `1` — the antenna with the most attributed windows (= system's answer).      |
-| `n_hits_winner`              | How many of the trial's windows attributed to the winning antenna (consistency).    |
-| `cross_reads`                | Number of EPCs that appeared on **more than one antenna** during the trial (same-tag leakage). **0 is the happy path.** Two different tags, each only on its own antenna, does **not** count — that is normal dual-cup behaviour. |
-| `cross_read_epcs`            | Which EPC(s) leaked (blank when clean).                                             |
-| `clean`                      | `yes` iff `cross_reads == 0`.                                                       |
+| `session_id`                 | Timestamp of the test session (groups all trials from one run together).            |
+| `scenario`                   | Physical setup under test (e.g. `drip_tray_empty_cup_empty`).                       |
+| `power_mw`                   | TX power used for this trial (mW).                                                  |
+| `swap_rate_3s_hz`            | Per-EPC antenna swaps observed within the first 3 s, in Hz. `0.0` = stable answer; rising values = the arbitrator was flipping the tag between antennas. |
+| `winning_antenna`            | Per-EPC home antenna (last 6 hex chars → `antN`). E.g. with two cups: `6E6F76 -> ant0, 6E6FD6 -> ant1`. |
+| `cross_reads`                | Number of EPCs that appeared on **both** antennas during the trial (same-tag leakage). **0 is the happy path.** Two different tags, each only on its own antenna, does **not** count. |
 | `best_rssi_winner_dbm`       | Strongest (closest-to-zero) RSSI on the winning antenna across the trial.           |
 | `detected_epcs`              | Every distinct EPC seen during the trial, regardless of antenna.                    |
-
-Each trial also stores the full per-window trace in a second sheet
-(`Windows`) so you can drill in: see exactly which antenna got which
-EPC at every 1-second decision window.
+| `tag_photo`                  | Embedded thumbnail of `images/tags/<tag>.png`.                                      |
+| `result`                     | One-word verdict (colour-coded): **PASS** (verified ≤3 s, clean) / **SLOW** (verified + clean, >3 s) / **DIRTY** (same EPC seen on both antennas) / **FAIL** (no attribution). |
+| `notes`                      | Free-text comment you typed at the post-trial prompt.                               |
 
 ## Test axes
 
@@ -59,12 +55,13 @@ The per-`(scenario, power, tag)` trial counter only advances when you
 choose to save, so the spreadsheet stays sequential even if you re-do a
 trial that didn't go well.
 
-**Results always append to the same `results.xlsx`.** Every run of the
-program writes new rows under the existing header — `session_id` is
-stamped per run so you can still tell which run a row came from. If a
-new version of this script adds extra columns to the schema, they are
-appended to the right of the existing header row in place; your old
-rows are preserved, with blanks under the new columns.
+**Results always append to the same `results.xlsx`** for as long as the
+schema matches. Every run writes new rows under the existing header —
+`session_id` is stamped per run so you can still tell which run a row
+came from. If a newer version of this script changes the column layout,
+the existing file is renamed to `results_archive_<timestamp>.xlsx` so
+your old data is preserved alongside, and a fresh `results.xlsx` is
+created for the new layout.
 
 ## Files
 
@@ -193,56 +190,22 @@ know when to slide.
 ## Reading the spreadsheet
 
 `results.xlsx` is created automatically on the first trial and appended
-to thereafter — every run of the program writes new rows into the
-same two sheets (`Trials` and `Windows`). The header row is frozen, the
-verdict (`result`) is colour-coded for at-a-glance scanning, and the
-photos are embedded as thumbnails next to each row.
+to thereafter — every run writes new rows into the single `Trials`
+sheet. The header row is dark-navy / white, frozen so it stays visible
+while scrolling, and rows are striped white/off-white for readability.
+The `result` verdict is colour-coded as a soft pill (green PASS / amber
+SLOW / orange DIRTY / red FAIL), and the `tag_photo` column holds an
+embedded thumbnail of the tag used.
 
-If a newer version of this script adds extra columns, they are appended
-to the right of the existing header row on the next startup; your old
-rows are preserved (with blanks under the new columns).
+If a newer version of this script changes the column layout, the
+existing file is renamed to `results_archive_<timestamp>.xlsx` and a
+fresh `results.xlsx` is created with the new layout. Your old data is
+preserved alongside, untouched.
 
-### Sheet `Trials` — one row per trial
+### Column reference
 
-| Column                       | Description |
-|------------------------------|-------------|
-| `session_id`                 | Timestamp of the session (e.g. `20260527-143200`). |
-| `trial_num`                  | 1-based counter, **independent per (scenario, power, tag) combination**. Only advances when you confirm-save the trial. |
-| `scenario`                   | Name from `SCENARIOS`. |
-| `power_mw`                   | TX power for this trial. |
-| `tag`                        | Tag-name (file in `images/tags/`). |
-| `start_time`                 | Wall-clock at "GO!". |
-| `duration_s`                 | Actual elapsed time of the trial. |
-| `n_windows`                  | Number of 1-second decision windows the C binary emitted during the trial. |
-| `result`                     | PASS / SLOW / DIRTY / FAIL (colour-coded). |
-| `verified`                   | `yes` / `no`. |
-| `ttv_s`                      | Time to verification (s). Blank if not verified. |
-| `within_3s`                  | `yes` / `no`. |
-| `winning_antenna`            | `0` / `1` / blank. |
-| `n_hits_winner`              | Windows that attributed to the winning antenna. |
-| `cross_reads`                | Windows that attributed to the OTHER antenna. |
-| `clean`                      | `yes` iff `cross_reads == 0`. |
-| `best_rssi_winner_dbm`       | Strongest RSSI on the winning antenna across the trial. |
-| `detected_epcs`              | All unique EPCs detected, comma-separated. |
-| `notes`                      | Comment entered at the post-trial prompt. You can also edit / extend this directly in Excel later. |
-| `scenario_photo`             | Embedded thumbnail of `images/scenarios/<scenario>.png` (if present). |
-| `tag_photo`                  | Embedded thumbnail of `images/tags/<tag>.png`. |
-
-### Sheet `Windows` — one row per 1-second decision window
-
-| Column           | Description |
-|------------------|-------------|
-| `session_id`     | Matches the trials sheet. |
-| `trial_num`      | Matches the trials sheet. |
-| `scenario`       | Matches the trials sheet. |
-| `power_mw`       | Matches the trials sheet. |
-| `tag`            | Matches the trials sheet. |
-| `window_idx`     | 1-based index of this window within the trial. |
-| `t_offset_s`     | Seconds from "GO!" to this window's print line. |
-| `ant0_epcs`      | Pipe-separated EPCs the arbitrator attributed to antenna 0. |
-| `ant0_rssis_dbm` | Pipe-separated max RSSIs (winning value) per EPC, in dBm. |
-| `ant1_epcs`      | Pipe-separated EPCs attributed to antenna 1. |
-| `ant1_rssis_dbm` | Pipe-separated RSSIs for antenna 1. |
+See the [What the test measures](#what-the-test-measures) table at the
+top of this document for the full column list and definitions.
 
 ## Tweaks
 
