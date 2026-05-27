@@ -523,8 +523,8 @@ def _sheet_headers(ws: Any) -> List[str]:
 
 
 def _create_fresh_workbook() -> None:
-    """Write a brand-new ``beer-pour-results.xlsx`` with the current
-    schema and the styled header row applied."""
+    """Write a brand-new ``beer-pour-results.xlsx`` with the current schema and
+    the styled header row applied."""
     wb = Workbook()
     default = wb.active
     wb.remove(default)
@@ -537,8 +537,7 @@ def _create_fresh_workbook() -> None:
 
 
 def ensure_workbook() -> None:
-    """Make sure ``beer-pour-results.xlsx`` exists with the current
-    column schema.
+    """Make sure ``beer-pour-results.xlsx`` exists with the current column schema.
 
     Schema policy:
     - File missing -> create a fresh one.

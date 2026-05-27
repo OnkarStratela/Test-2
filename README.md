@@ -192,16 +192,16 @@ know when to slide.
 
 `beer-pour-results.xlsx` is created automatically on the first trial
 and appended to thereafter — every run writes new rows into the single
-`Trials` sheet. The header row is dark-navy / white, frozen so it stays visible
-while scrolling, and rows are striped white/off-white for readability.
-The `result` verdict is colour-coded as a soft pill (green PASS / amber
-SLOW / orange DIRTY / red FAIL), and the `tag_photo` column holds an
-embedded thumbnail of the tag used.
+`Trials` sheet. The header row is dark-navy / white, frozen so it stays
+visible while scrolling, and rows are striped white/off-white for
+readability. The `result` verdict is colour-coded as a soft pill (green
+PASS / amber SLOW / orange DIRTY / red FAIL), and the `tag_photo`
+column holds an embedded thumbnail of the tag used.
 
 If a newer version of this script changes the column layout, the
-existing file is renamed to `results_archive_<timestamp>.xlsx` and a
-fresh `beer-pour-results.xlsx` is created with the new layout. Your
-old data is preserved alongside, untouched.
+existing file is renamed to `beer-pour-results_archive_<timestamp>.xlsx`
+and a fresh `beer-pour-results.xlsx` is created with the new layout.
+Your old data is preserved alongside, untouched.
 
 ### Column reference
 
