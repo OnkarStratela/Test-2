@@ -2,4 +2,4 @@
 # beer_pour_logger has a place to look for scenario photos. Drop a
 # <scenario_name>.png in here (matching one of the names in SCENARIOS
 # inside beer_pour_logger.py) and it will be embedded next to that
-# scenario's trial rows in results.xlsx.
+# scenario's trial rows in beer-pour-results.xlsx.

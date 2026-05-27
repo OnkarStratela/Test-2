@@ -1,7 +1,7 @@
 """Beer-pour-machine RFID verification test logger.
 
 Drives the existing ``rfid_gc_live`` C binary one trial at a time and records
-every trial to a single master Excel workbook (``results.xlsx``).
+every trial to a single master Excel workbook (``beer-pour-results.xlsx``).
 
 The C binary is the arbitrated dual-antenna scanner from ``rfid_gc_live.c``:
 it runs both antennas at maximum scan rate, accumulates per-EPC stats for one
@@ -70,7 +70,7 @@ RFID_BINARY    = SCRIPT_DIR / "rfid_gc_live"
 IMAGES_DIR     = SCRIPT_DIR / "images"
 TAGS_DIR       = IMAGES_DIR / "tags"
 SCENARIOS_DIR  = IMAGES_DIR / "scenarios"
-RESULTS_XLSX   = SCRIPT_DIR / "results.xlsx"
+RESULTS_XLSX   = SCRIPT_DIR / "beer-pour-results.xlsx"
 THUMB_DIR      = SCRIPT_DIR / ".thumbs"
 
 # Fixed set of physical scenarios under test on the beer-pour machine.
@@ -523,8 +523,8 @@ def _sheet_headers(ws: Any) -> List[str]:
 
 
 def _create_fresh_workbook() -> None:
-    """Write a brand-new ``results.xlsx`` with the current schema and
-    the styled header row applied."""
+    """Write a brand-new ``beer-pour-results.xlsx`` with the current
+    schema and the styled header row applied."""
     wb = Workbook()
     default = wb.active
     wb.remove(default)
@@ -537,7 +537,8 @@ def _create_fresh_workbook() -> None:
 
 
 def ensure_workbook() -> None:
-    """Make sure ``results.xlsx`` exists with the current column schema.
+    """Make sure ``beer-pour-results.xlsx`` exists with the current
+    column schema.
 
     Schema policy:
     - File missing -> create a fresh one.
@@ -571,7 +572,7 @@ def ensure_workbook() -> None:
         return
 
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    archive = RESULTS_XLSX.with_name(f"results_archive_{stamp}.xlsx")
+    archive = RESULTS_XLSX.with_name(f"beer-pour-results_archive_{stamp}.xlsx")
     print(
         f"NOTE: {RESULTS_XLSX.name} has an older column layout; "
         f"archiving it to {archive.name} and starting a fresh sheet."
@@ -624,7 +625,7 @@ def _write_row_by_header(ws: Any, row: int,
 
 
 def append_trial(session_id: str, t: TrialResult, comment: str = "") -> None:
-    """Append one trial as a single row to ``results.xlsx``. Empty rows
+    """Append one trial as a single row to ``beer-pour-results.xlsx``. Empty rows
     are not written; every call adds exactly one new row regardless of
     how many windows were in the trial. The tag photo (when present in
     ``images/tags/<tag>.png``) is embedded in the row's ``tag_photo``

@@ -14,7 +14,7 @@ slide the cup and let the system make the call.
 
 ## What the test measures
 
-Each trial is **one row** in `results.xlsx` with these columns (in order):
+Each trial is **one row** in `beer-pour-results.xlsx` with these columns (in order):
 
 | Column                       | What it means                                                                       |
 |------------------------------|-------------------------------------------------------------------------------------|
@@ -55,13 +55,14 @@ The per-`(scenario, power, tag)` trial counter only advances when you
 choose to save, so the spreadsheet stays sequential even if you re-do a
 trial that didn't go well.
 
-**Results always append to the same `results.xlsx`** for as long as the
-schema matches. Every run writes new rows under the existing header —
-`session_id` is stamped per run so you can still tell which run a row
-came from. If a newer version of this script changes the column layout,
-the existing file is renamed to `results_archive_<timestamp>.xlsx` so
-your old data is preserved alongside, and a fresh `results.xlsx` is
-created for the new layout.
+**Results always append to the same `beer-pour-results.xlsx`** for as
+long as the schema matches. Every run writes new rows under the
+existing header — `session_id` is stamped per run so you can still tell
+which run a row came from. If a newer version of this script changes
+the column layout, the existing file is renamed to
+`beer-pour-results_archive_<timestamp>.xlsx` so your old data is
+preserved alongside, and a fresh `beer-pour-results.xlsx` is created
+for the new layout.
 
 ## Files
 
@@ -74,7 +75,7 @@ created for the new layout.
 | `run_gc.sh`                | Compile-and-run wrapper for `rfid_gc_live` (interactive use, no logging). |
 | `run_standard.sh`          | Compile-and-run wrapper for `rfid_standard`. |
 | `run_test.sh`              | **One-shot test runner.** Checks SRC, fixes USB perms, compiles `rfid_gc_live`, launches the Python logger. Preferred entry point for a test session. |
-| `beer_pour_logger.py`      | Python test harness. Drives `rfid_gc_live` one trial at a time, captures every window, computes the metrics above, appends to `results.xlsx` (with operator confirmation). |
+| `beer_pour_logger.py`      | Python test harness. Drives `rfid_gc_live` one trial at a time, captures every window, computes the metrics above, appends to `beer-pour-results.xlsx` (with operator confirmation). |
 | `requirements.txt`         | Python deps for the logger: `openpyxl`, `Pillow`. |
 | `images/scenarios/`        | Optional photos of each scenario — embedded next to the trial row when present. |
 | `images/tags/`             | Photos of each tag type. **The filename (without `.png`) is the tag name** that shows up in the menu. |
@@ -123,7 +124,7 @@ Sample session:
 
 ```
 === Beer-pour RFID verification test session 20260527-143200 ===
-Results : /home/stratela/Test-2/results.xlsx
+Results : /home/stratela/Test-2/beer-pour-results.xlsx
 Reader  : rfid_gc_live
 Trial   : 5.0 s  (verify deadline: 3.0 s)
 
@@ -159,7 +160,7 @@ Select tag types [1..1]: 1
 [Trial #1] PASS -- verified in 1.00 s, homes [E1A1234->ant0], 0 leaking EPC(s), best RSSI -58.3 dBm
     Save this trial? [Y/n]: <ENTER>
     Comment for notes column (ENTER to skip): cup slid smoothly over ant0
-    logged to results.xlsx
+    logged to beer-pour-results.xlsx
 ```
 
 The reader's sweep lines are forwarded verbatim to your terminal (same
@@ -189,9 +190,9 @@ know when to slide.
 
 ## Reading the spreadsheet
 
-`results.xlsx` is created automatically on the first trial and appended
-to thereafter — every run writes new rows into the single `Trials`
-sheet. The header row is dark-navy / white, frozen so it stays visible
+`beer-pour-results.xlsx` is created automatically on the first trial
+and appended to thereafter — every run writes new rows into the single
+`Trials` sheet. The header row is dark-navy / white, frozen so it stays visible
 while scrolling, and rows are striped white/off-white for readability.
 The `result` verdict is colour-coded as a soft pill (green PASS / amber
 SLOW / orange DIRTY / red FAIL), and the `tag_photo` column holds an
@@ -199,8 +200,8 @@ embedded thumbnail of the tag used.
 
 If a newer version of this script changes the column layout, the
 existing file is renamed to `results_archive_<timestamp>.xlsx` and a
-fresh `results.xlsx` is created with the new layout. Your old data is
-preserved alongside, untouched.
+fresh `beer-pour-results.xlsx` is created with the new layout. Your
+old data is preserved alongside, untouched.
 
 ### Column reference
 
@@ -222,4 +223,4 @@ top of this document for the full column list and definitions.
 - **`Could not connect (code …)`** — check USB, then `sudo chmod 666 /dev/ttyACM0` (or add yourself to `dialout` group and re-login).
 - **All trials show `FAIL`** — make sure you're sliding the cup quickly after the `GO!` prompt; the trial clock starts when `[GC] Ready` appears.
 - **Lots of `DIRTY` results** — the same EPC is showing up on both antennas (`cross_read_epcs` column tells you which). Likely cause: one tag sitting between antennas, or `GC_RSSI_MARGIN_DB10` in `rfid_gc_live.c` is too low. If you deliberately have one tag per antenna and each EPC only ever appears on its home antenna, you should see **PASS**, not DIRTY.
-- **`results.xlsx` write fails** — Excel locks the file when it's open. Close it and retry the trial.
+- **`beer-pour-results.xlsx` write fails** — Excel locks the file when it's open. Close it and retry the trial.
