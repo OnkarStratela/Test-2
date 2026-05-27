@@ -19,11 +19,12 @@ quality of that call:
 
 - ``winning_antenna``  the antenna with the most attributions across the
                        trial (i.e. the system's "answer")
-- ``cross_reads``      number of windows that ALSO put a tag on the OTHER
-                       antenna -- a non-zero value means the arbitrator
-                       was flip-flopping during the slide, which is what
-                       the per-window dominance rule is supposed to
-                       prevent.
+- ``cross_reads``      number of EPCs that appeared on more than one
+                       antenna during the trial (true leakage / flip-flop
+                       of the *same* tag). Two different tags, each on
+                       its own antenna, does NOT count as a cross-read.
+- ``cross_read_epcs``  comma-separated list of those leaking EPCs (blank
+                       when clean).
 - ``ttv_s``            seconds from "GO!" to the first window that
                        attributed anything (= time-to-verification)
 - ``within_3s``        ``ttv_s <= 3.0`` (the product spec deadline)
@@ -205,12 +206,39 @@ class TrialResult:
                     seen.append(epc)
         return seen
 
+    def _epc_antenna_hit_counts(self) -> Dict[str, Tuple[int, int]]:
+        """Per EPC: (windows attributed on ant0, windows attributed on ant1)."""
+        counts: Dict[str, List[int]] = {}
+        for w in self.windows:
+            for ant, tags in ((0, w.ant0), (1, w.ant1)):
+                for epc, _ in tags:
+                    if epc not in counts:
+                        counts[epc] = [0, 0]
+                    counts[epc][ant] += 1
+        return {epc: (c[0], c[1]) for epc, c in counts.items()}
+
+    @property
+    def epc_home_antennas(self) -> Dict[str, int]:
+        """For each detected EPC, the antenna it was attributed to most
+        often during the trial (= where the arbitrator thinks that tag
+        lives). Ties go to the lower antenna index."""
+        homes: Dict[str, int] = {}
+        for epc, (n0, n1) in self._epc_antenna_hit_counts().items():
+            if n0 == 0 and n1 == 0:
+                continue
+            homes[epc] = 0 if n0 >= n1 else 1
+        return homes
+
     @property
     def winning_antenna(self) -> Optional[int]:
-        """The antenna with the most attributed windows across the trial.
-        This is the system's "answer" -- whichever antenna the arbitrator
-        decided the cup was closest to. ``None`` if the trial saw no
-        attribution on either antenna."""
+        """Summary antenna for the trial. With a single detected EPC this
+        is that tag's home antenna. With multiple EPCs it is the antenna
+        that saw the most attributed windows overall. ``None`` if the
+        trial saw no attribution."""
+        if not self.detected_epcs:
+            return None
+        if len(self.detected_epcs) == 1:
+            return self.epc_home_antennas.get(self.detected_epcs[0])
         n0 = sum(1 for w in self.windows if w.ant0)
         n1 = sum(1 for w in self.windows if w.ant1)
         if n0 == 0 and n1 == 0:
@@ -241,16 +269,22 @@ class TrialResult:
         return sum(1 for w in self.windows if w.tags_on(self.winning_antenna))
 
     @property
+    def cross_read_epcs(self) -> List[str]:
+        """EPCs that were attributed to BOTH antennas at some point during
+        the trial. This is the real cross-read failure mode: the same tag
+        leaking onto the wrong antenna. Two *different* tags sitting on
+        two different antennas (one EPC per antenna only) is normal and
+        does not appear here."""
+        leaked: List[str] = []
+        for epc, (n0, n1) in self._epc_antenna_hit_counts().items():
+            if n0 > 0 and n1 > 0:
+                leaked.append(epc)
+        return sorted(leaked)
+
+    @property
     def cross_reads(self) -> int:
-        """Number of windows that attributed any tag to the OTHER antenna
-        (= not the winner). With the arbitrator's dominance rule working
-        as designed this should be 0; anything >0 means the trial was
-        flip-flopping between antennas, which is the failure mode we
-        care about avoiding in the beer-pour use case."""
-        if self.winning_antenna is None:
-            return 0
-        other = 1 - self.winning_antenna
-        return sum(1 for w in self.windows if w.tags_on(other))
+        """How many distinct EPCs leaked onto more than one antenna."""
+        return len(self.cross_read_epcs)
 
     @property
     def clean(self) -> bool:
@@ -275,9 +309,8 @@ class TrialResult:
 
         - ``PASS``  verified, within 3 s, no cross-reads
         - ``SLOW``  verified + clean but took longer than 3 s
-        - ``DIRTY`` verified but the other antenna also got hits at some
-                    point during the trial (= flip-flop, what the arbitrator
-                    is meant to prevent)
+        - ``DIRTY`` verified but at least one EPC was attributed to more
+                    than one antenna during the trial (same-tag leakage)
         - ``FAIL``  never got any attribution
         """
         if not self.verified:
@@ -308,6 +341,7 @@ TRIALS_HEADERS: List[str] = [
     "winning_antenna",
     "n_hits_winner",
     "cross_reads",
+    "cross_read_epcs",
     "clean",
     "best_rssi_winner_dbm",
     "detected_epcs",
@@ -318,7 +352,7 @@ TRIALS_HEADERS: List[str] = [
 
 TRIALS_WIDTHS: List[int] = [
     16, 10, 32, 9, 14, 22, 11, 11, 9, 10, 9,
-    11, 17, 14, 12, 8, 21, 60, 30, 22, 16,
+    11, 17, 14, 12, 36, 8, 21, 60, 30, 22, 16,
 ]
 
 WINDOWS_HEADERS: List[str] = [
@@ -343,7 +377,7 @@ _CENTERED_TRIALS = {
     "trial_num", "power_mw", "duration_s", "n_windows",
     "result", "verified", "ttv_s",
     f"within_{int(VERIFY_DEADLINE_S)}s",
-    "winning_antenna", "n_hits_winner", "cross_reads", "clean",
+    "winning_antenna", "n_hits_winner", "cross_reads", "cross_read_epcs", "clean",
     "best_rssi_winner_dbm",
 }
 _CENTERED_WINDOWS = {
@@ -511,6 +545,7 @@ def append_trial(session_id: str, t: TrialResult) -> None:
         t.winning_antenna if t.winning_antenna is not None else "",
         t.n_hits_winner,
         t.cross_reads,
+        ", ".join(t.cross_read_epcs),
         "yes" if t.clean else "no",
         t.best_rssi_winner if t.best_rssi_winner is not None else "",
         ", ".join(t.detected_epcs),
@@ -773,11 +808,21 @@ def main() -> int:
                 win = result.winning_antenna
                 rssi = (f"{result.best_rssi_winner:.1f} dBm"
                         if result.best_rssi_winner is not None else "?")
+                homes = ", ".join(
+                    f"{epc[-6:]}->ant{ant}"
+                    for epc, ant in sorted(result.epc_home_antennas.items())
+                )
+                cross_msg = (
+                    f"{result.cross_reads} leaking EPC(s): "
+                    f"{', '.join(result.cross_read_epcs)}"
+                    if result.cross_read_epcs
+                    else "0 leaking EPC(s)"
+                )
                 print(
                     f"[Trial #{tentative_num}] {result.result} -- "
                     f"verified in {result.ttv_s:.2f} s, "
-                    f"winner ant{win} ({result.n_hits_winner}/{result.n_windows} windows), "
-                    f"{result.cross_reads} cross-read(s), "
+                    f"homes [{homes}], "
+                    f"{cross_msg}, "
                     f"best RSSI {rssi}"
                 )
             else:

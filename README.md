@@ -24,7 +24,8 @@ For each trial the harness records:
 | `within_3s`                  | `ttv_s ≤ 3.0` — the product-spec deadline.                                         |
 | `winning_antenna`            | `0` or `1` — the antenna with the most attributed windows (= system's answer).      |
 | `n_hits_winner`              | How many of the trial's windows attributed to the winning antenna (consistency).    |
-| `cross_reads`                | Windows that attributed any tag to the OTHER antenna. **0 means the arbitrator held one consistent decision**; anything >0 means it flip-flopped, which is what the per-window dominance rule is meant to prevent. |
+| `cross_reads`                | Number of EPCs that appeared on **more than one antenna** during the trial (same-tag leakage). **0 is the happy path.** Two different tags, each only on its own antenna, does **not** count — that is normal dual-cup behaviour. |
+| `cross_read_epcs`            | Which EPC(s) leaked (blank when clean).                                             |
 | `clean`                      | `yes` iff `cross_reads == 0`.                                                       |
 | `best_rssi_winner_dbm`       | Strongest (closest-to-zero) RSSI on the winning antenna across the trial.           |
 | `detected_epcs`              | Every distinct EPC seen during the trial, regardless of antenna.                    |
@@ -161,7 +162,7 @@ the harness prints a single-line verdict.
 |-----------|---------|
 | **PASS**  | `verified == yes`, `within_3s == yes`, `cross_reads == 0`. The happy path. |
 | **SLOW**  | Verified + clean, but `ttv_s > 3.0`. The arbitrator got it right but missed the 3-second deadline (e.g. the operator hadn't actually placed the cup yet). |
-| **DIRTY** | Verified, but the other antenna also got attributed at some point. Investigate: physical alignment / arbitration thresholds. |
+| **DIRTY** | Verified, but at least one EPC was attributed to both antennas during the trial (same tag leaking). Two different tags on two different antennas is **not** DIRTY. |
 | **FAIL**  | No attribution at all in the trial. |
 
 Press `'q'` (or Ctrl-C) at the menu to end the session.
@@ -243,5 +244,5 @@ different column layout, the harness automatically backs it up to
 - **`ModuleNotFoundError: openpyxl`** — `sudo apt install -y python3-openpyxl python3-pil` (or `pip3 install --break-system-packages -r requirements.txt`).
 - **`Could not connect (code …)`** — check USB, then `sudo chmod 666 /dev/ttyACM0` (or add yourself to `dialout` group and re-login).
 - **All trials show `FAIL`** — make sure you're sliding the cup quickly after the `GO!` prompt; the trial clock starts when `[GC] Ready` appears.
-- **Lots of `DIRTY` results** — the arbitrator is letting the opposite antenna through. Likely cause: a tag is sitting roughly equidistant between both antennas, or `GC_RSSI_MARGIN_DB10` in `rfid_gc_live.c` is too low for your physical layout.
+- **Lots of `DIRTY` results** — the same EPC is showing up on both antennas (`cross_read_epcs` column tells you which). Likely cause: one tag sitting between antennas, or `GC_RSSI_MARGIN_DB10` in `rfid_gc_live.c` is too low. If you deliberately have one tag per antenna and each EPC only ever appears on its home antenna, you should see **PASS**, not DIRTY.
 - **`results.xlsx` write fails** — Excel locks the file when it's open. Close it and retry the trial.
