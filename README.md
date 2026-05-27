@@ -47,12 +47,24 @@ from the data.
 | Power (mW)        | `30`, `175`, `316` (editable in `POWER_LEVELS_MW`)                            |
 | Tag type          | Auto-discovered from `images/tags/*.png`. Drop e.g. `images/tags/foam.png` to register a new tag. |
 
-After every trial the harness prints a verdict line and asks
-**`Save this trial? [Y/n]`** — press ENTER (or `y`) to append the row,
-`n` to discard it. The per-`(scenario, power, tag)` trial counter only
-advances when you choose to save, so the spreadsheet stays sequential
-even if you re-do a trial that didn't go well (e.g. you slid the cup
-too slowly).
+After every trial the harness prints a verdict line and asks:
+
+1. **`Save this trial? [Y/n]`** — ENTER (or `y`) keeps the row, `n` discards it.
+2. **`Comment for notes column (ENTER to skip)`** — optional free-text
+   note that goes into the `notes` column for this row (e.g.
+   "cup slid too slowly", "tag was loose", "this is the one to show in
+   the demo"). Press ENTER for no comment.
+
+The per-`(scenario, power, tag)` trial counter only advances when you
+choose to save, so the spreadsheet stays sequential even if you re-do a
+trial that didn't go well.
+
+**Results always append to the same `results.xlsx`.** Every run of the
+program writes new rows under the existing header — `session_id` is
+stamped per run so you can still tell which run a row came from. If a
+new version of this script adds extra columns to the schema, they are
+appended to the right of the existing header row in place; your old
+rows are preserved, with blanks under the new columns.
 
 ## Files
 
@@ -147,8 +159,9 @@ Select tag types [1..1]: 1
     [TX=30 mW] [(0)(-58.5) E2801160600002054E1A1234,                                      ]
     []
     [TX=30 mW] [(0)(-58.6) E2801160600002054E1A1234,                                      ]
-[Trial #1] PASS -- verified in 1.00 s, winner ant0 (4/5 windows), 0 cross-read(s), best RSSI -58.3 dBm
+[Trial #1] PASS -- verified in 1.00 s, homes [E1A1234->ant0], 0 leaking EPC(s), best RSSI -58.3 dBm
     Save this trial? [Y/n]: <ENTER>
+    Comment for notes column (ENTER to skip): cup slid smoothly over ant0
     logged to results.xlsx
 ```
 
@@ -180,13 +193,14 @@ know when to slide.
 ## Reading the spreadsheet
 
 `results.xlsx` is created automatically on the first trial and appended
-to thereafter. The header row is frozen, the verdict (`result`) is
-colour-coded for at-a-glance scanning, and the photos are embedded as
-thumbnails next to each row.
+to thereafter — every run of the program writes new rows into the
+same two sheets (`Trials` and `Windows`). The header row is frozen, the
+verdict (`result`) is colour-coded for at-a-glance scanning, and the
+photos are embedded as thumbnails next to each row.
 
-If a previous version of this script left a `results.xlsx` with a
-different column layout, the harness automatically backs it up to
-`results.xlsx.bak` and starts a fresh file with the new schema.
+If a newer version of this script adds extra columns, they are appended
+to the right of the existing header row on the next startup; your old
+rows are preserved (with blanks under the new columns).
 
 ### Sheet `Trials` — one row per trial
 
@@ -210,7 +224,7 @@ different column layout, the harness automatically backs it up to
 | `clean`                      | `yes` iff `cross_reads == 0`. |
 | `best_rssi_winner_dbm`       | Strongest RSSI on the winning antenna across the trial. |
 | `detected_epcs`              | All unique EPCs detected, comma-separated. |
-| `notes`                      | Free-text — type here in Excel after a trial. |
+| `notes`                      | Comment entered at the post-trial prompt. You can also edit / extend this directly in Excel later. |
 | `scenario_photo`             | Embedded thumbnail of `images/scenarios/<scenario>.png` (if present). |
 | `tag_photo`                  | Embedded thumbnail of `images/tags/<tag>.png`. |
 

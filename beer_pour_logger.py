@@ -450,55 +450,74 @@ def _style_data_row(ws: Any, row: int, headers: List[str],
                                    wrap_text=False)
 
 
-def ensure_workbook() -> None:
-    """Create ``results.xlsx`` if it doesn't exist. If an existing file
-    has different headers (older schema from a previous version of this
-    script), back it up to ``results.xlsx.bak`` and start fresh so the
-    new schema isn't silently misaligned with old rows."""
-    if RESULTS_XLSX.exists():
-        try:
-            wb = load_workbook(RESULTS_XLSX)
-            if "Trials" in wb.sheetnames:
-                trials = wb["Trials"]
-                existing = [
-                    trials.cell(row=1, column=i + 1).value
-                    for i in range(len(TRIALS_HEADERS))
-                ]
-                if existing != TRIALS_HEADERS:
-                    bak = RESULTS_XLSX.with_suffix(".xlsx.bak")
-                    print(
-                        f"NOTE: existing {RESULTS_XLSX.name} has an older "
-                        f"schema; backing up to {bak.name} and starting fresh."
-                    )
-                    if bak.exists():
-                        bak.unlink()
-                    RESULTS_XLSX.rename(bak)
-        except Exception:
-            pass
+def _sheet_headers(ws: Any) -> List[str]:
+    """Read the header row from a sheet and return the column names in
+    the order they actually appear in the file. Trailing ``None``s are
+    trimmed (openpyxl pads to ``max_column``)."""
+    headers = [
+        ws.cell(row=1, column=c + 1).value
+        for c in range(ws.max_column)
+    ]
+    while headers and (headers[-1] is None or headers[-1] == ""):
+        headers.pop()
+    return [str(h) for h in headers]
 
-    if RESULTS_XLSX.exists():
-        # Headers match -- just re-apply formatting in case it was stripped.
-        wb = load_workbook(RESULTS_XLSX)
-        for s in ("Trials", "Windows"):
-            if s in wb.sheetnames:
-                _apply_header_style(wb[s])
+
+def _ensure_sheet(wb: Workbook, sheet_name: str,
+                  canonical_headers: List[str],
+                  widths: List[int]) -> List[str]:
+    """Create the sheet if missing, or extend it with any new columns
+    that have been added to the canonical header list since the file
+    was created. Returns the list of headers as they appear in the
+    sheet right now (in file order, possibly with extra columns at
+    the end that newer canonical schemas know about)."""
+    if sheet_name not in wb.sheetnames:
+        ws = wb.create_sheet(sheet_name)
+        ws.append(canonical_headers)
+        for col, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(col)].width = w
+        _apply_header_style(ws)
+        return list(canonical_headers)
+
+    ws = wb[sheet_name]
+    existing = _sheet_headers(ws)
+    existing_set = set(existing)
+    next_col = len(existing) + 1
+    for h in canonical_headers:
+        if h not in existing_set:
+            ws.cell(row=1, column=next_col, value=h)
+            existing.append(h)
+            existing_set.add(h)
+            next_col += 1
+    # Reasonable widths: pick the canonical width when we know it,
+    # otherwise leave the column alone.
+    width_by_name = dict(zip(canonical_headers, widths))
+    for idx, name in enumerate(existing, start=1):
+        if name in width_by_name:
+            ws.column_dimensions[get_column_letter(idx)].width = width_by_name[name]
+    _apply_header_style(ws)
+    return existing
+
+
+def ensure_workbook() -> None:
+    """Create ``results.xlsx`` if it doesn't exist, otherwise extend any
+    sheets in-place to accommodate new columns the canonical schema knows
+    about. Existing rows are preserved across upgrades -- new columns
+    show up at the right of older rows with blank cells."""
+    if not RESULTS_XLSX.exists():
+        wb = Workbook()
+        # Workbook() starts with an unnamed sheet; we discard it and let
+        # _ensure_sheet create the named sheets cleanly.
+        default = wb.active
+        wb.remove(default)
+        _ensure_sheet(wb, "Trials",  TRIALS_HEADERS,  TRIALS_WIDTHS)
+        _ensure_sheet(wb, "Windows", WINDOWS_HEADERS, WINDOWS_WIDTHS)
         wb.save(RESULTS_XLSX)
         return
 
-    wb = Workbook()
-    trials = wb.active
-    trials.title = "Trials"
-    trials.append(TRIALS_HEADERS)
-    for col, w in enumerate(TRIALS_WIDTHS, start=1):
-        trials.column_dimensions[get_column_letter(col)].width = w
-    _apply_header_style(trials)
-
-    windows = wb.create_sheet("Windows")
-    windows.append(WINDOWS_HEADERS)
-    for col, w in enumerate(WINDOWS_WIDTHS, start=1):
-        windows.column_dimensions[get_column_letter(col)].width = w
-    _apply_header_style(windows)
-
+    wb = load_workbook(RESULTS_XLSX)
+    _ensure_sheet(wb, "Trials",  TRIALS_HEADERS,  TRIALS_WIDTHS)
+    _ensure_sheet(wb, "Windows", WINDOWS_HEADERS, WINDOWS_WIDTHS)
     wb.save(RESULTS_XLSX)
 
 
@@ -519,73 +538,91 @@ def _thumb_for(src_dir: Path, name: str) -> Optional[Path]:
     return dst
 
 
-def append_trial(session_id: str, t: TrialResult) -> None:
+def _write_row_by_header(ws: Any, row: int, values: Dict[str, Any]) -> None:
+    """Write ``values`` to ``row`` using the sheet's actual header row to
+    decide which column each key goes in. Keys that aren't present in the
+    header row are silently ignored; columns that aren't in ``values``
+    are left blank. This is what keeps us robust against the file having
+    extra/older columns we don't know about."""
+    headers = _sheet_headers(ws)
+    for key, val in values.items():
+        if key in headers:
+            col = headers.index(key) + 1
+            ws.cell(row=row, column=col, value=val)
+
+
+def append_trial(session_id: str, t: TrialResult, comment: str = "") -> None:
     wb = load_workbook(RESULTS_XLSX)
     trials = wb["Trials"]
     windows = wb["Windows"]
 
-    scenario_col = get_column_letter(TRIALS_HEADERS.index("scenario_photo") + 1)
-    tag_col      = get_column_letter(TRIALS_HEADERS.index("tag_photo") + 1)
-    result_col   = TRIALS_HEADERS.index("result") + 1
-    next_row     = trials.max_row + 1
+    trial_headers  = _sheet_headers(trials)
+    window_headers = _sheet_headers(windows)
 
-    trials.append([
-        session_id,
-        t.trial_num,
-        t.scenario,
-        t.power_mw,
-        t.tag,
-        t.start_time.strftime("%Y-%m-%d %H:%M:%S"),
-        round(t.duration_s, 2),
-        t.n_windows,
-        t.result,
-        "yes" if t.verified else "no",
-        t.ttv_s if t.ttv_s is not None else "",
-        "yes" if t.within_deadline else "no",
-        t.winning_antenna if t.winning_antenna is not None else "",
-        t.n_hits_winner,
-        t.cross_reads,
-        ", ".join(t.cross_read_epcs),
-        "yes" if t.clean else "no",
-        t.best_rssi_winner if t.best_rssi_winner is not None else "",
-        ", ".join(t.detected_epcs),
-        "",
-        "",
-        "",
-    ])
+    next_row = trials.max_row + 1
+    trial_row = {
+        "session_id":            session_id,
+        "trial_num":             t.trial_num,
+        "scenario":              t.scenario,
+        "power_mw":              t.power_mw,
+        "tag":                   t.tag,
+        "start_time":            t.start_time.strftime("%Y-%m-%d %H:%M:%S"),
+        "duration_s":            round(t.duration_s, 2),
+        "n_windows":             t.n_windows,
+        "result":                t.result,
+        "verified":              "yes" if t.verified else "no",
+        "ttv_s":                 t.ttv_s if t.ttv_s is not None else "",
+        f"within_{int(VERIFY_DEADLINE_S)}s": "yes" if t.within_deadline else "no",
+        "winning_antenna":       t.winning_antenna if t.winning_antenna is not None else "",
+        "n_hits_winner":         t.n_hits_winner,
+        "cross_reads":           t.cross_reads,
+        "cross_read_epcs":       ", ".join(t.cross_read_epcs),
+        "clean":                 "yes" if t.clean else "no",
+        "best_rssi_winner_dbm":  t.best_rssi_winner if t.best_rssi_winner is not None else "",
+        "detected_epcs":         ", ".join(t.detected_epcs),
+        "notes":                 comment,
+    }
+    _write_row_by_header(trials, next_row, trial_row)
     trials.row_dimensions[next_row].height = ROW_HEIGHT_PT
 
-    _style_data_row(trials, next_row, TRIALS_HEADERS,
+    result_col = trial_headers.index("result") + 1 if "result" in trial_headers else None
+    _style_data_row(trials, next_row, trial_headers,
                     _CENTERED_TRIALS,
                     result_col=result_col, result_value=t.result)
 
-    s_thumb = _thumb_for(SCENARIOS_DIR, t.scenario)
-    if s_thumb is not None:
-        img = XLImage(str(s_thumb))
-        img.anchor = f"{scenario_col}{next_row}"
-        trials.add_image(img)
+    if "scenario_photo" in trial_headers:
+        s_thumb = _thumb_for(SCENARIOS_DIR, t.scenario)
+        if s_thumb is not None:
+            col_letter = get_column_letter(trial_headers.index("scenario_photo") + 1)
+            img = XLImage(str(s_thumb))
+            img.anchor = f"{col_letter}{next_row}"
+            trials.add_image(img)
 
-    t_thumb = _thumb_for(TAGS_DIR, t.tag)
-    if t_thumb is not None:
-        img = XLImage(str(t_thumb))
-        img.anchor = f"{tag_col}{next_row}"
-        trials.add_image(img)
+    if "tag_photo" in trial_headers:
+        t_thumb = _thumb_for(TAGS_DIR, t.tag)
+        if t_thumb is not None:
+            col_letter = get_column_letter(trial_headers.index("tag_photo") + 1)
+            img = XLImage(str(t_thumb))
+            img.anchor = f"{col_letter}{next_row}"
+            trials.add_image(img)
 
     for w in t.windows:
-        windows.append([
-            session_id,
-            t.trial_num,
-            t.scenario,
-            t.power_mw,
-            t.tag,
-            w.idx,
-            round(w.t_offset_s, 3),
-            "|".join(epc for epc, _ in w.ant0),
-            "|".join(f"{r:.1f}" for _, r in w.ant0),
-            "|".join(epc for epc, _ in w.ant1),
-            "|".join(f"{r:.1f}" for _, r in w.ant1),
-        ])
-        _style_data_row(windows, windows.max_row, WINDOWS_HEADERS,
+        next_w_row = windows.max_row + 1
+        window_row = {
+            "session_id":      session_id,
+            "trial_num":       t.trial_num,
+            "scenario":        t.scenario,
+            "power_mw":        t.power_mw,
+            "tag":             t.tag,
+            "window_idx":      w.idx,
+            "t_offset_s":      round(w.t_offset_s, 3),
+            "ant0_epcs":       "|".join(epc for epc, _ in w.ant0),
+            "ant0_rssis_dbm":  "|".join(f"{r:.1f}" for _, r in w.ant0),
+            "ant1_epcs":       "|".join(epc for epc, _ in w.ant1),
+            "ant1_rssis_dbm":  "|".join(f"{r:.1f}" for _, r in w.ant1),
+        }
+        _write_row_by_header(windows, next_w_row, window_row)
+        _style_data_row(windows, next_w_row, window_headers,
                         _CENTERED_WINDOWS)
 
     wb.save(RESULTS_XLSX)
@@ -728,6 +765,18 @@ def _prompt_save() -> bool:
         print("    Type 'y' (or ENTER) to save, 'n' to discard.")
 
 
+def _prompt_comment() -> str:
+    """Optional free-text comment written to the trial's ``notes`` column.
+    ENTER alone = no comment. Anything else is taken verbatim. Ctrl-C /
+    EOF also yields no comment (so a runaway keypress can't abort the
+    save we already confirmed)."""
+    try:
+        text = input("    Comment for notes column (ENTER to skip): ")
+    except (KeyboardInterrupt, EOFError):
+        return ""
+    return text.strip()
+
+
 def main() -> int:
     if not RFID_BINARY.is_file() or not os.access(RFID_BINARY, os.X_OK):
         print(f"ERROR: '{RFID_BINARY.name}' not found or not executable.")
@@ -835,10 +884,12 @@ def main() -> int:
                 print("    discarded (not saved).")
                 continue
 
+            comment = _prompt_comment()
+
             # Confirmed save -> commit the per-key counter and append.
             counters[key] = tentative_num
             try:
-                append_trial(session_id, result)
+                append_trial(session_id, result, comment=comment)
                 print(f"    logged to {RESULTS_XLSX.name}")
             except Exception as exc:
                 print(f"    ERROR writing to {RESULTS_XLSX.name}: {exc}")
