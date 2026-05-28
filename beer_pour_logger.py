@@ -31,7 +31,7 @@ each trial is one row with these columns:
 - ``best_rssi_winner_dbm`` strongest RSSI on the winning antenna
 - ``detected_epcs``        every distinct EPC seen during the trial
 - ``tag_photo``            embedded thumbnail of the tag used
-- ``result``               PASS / SLOW / DIRTY / FAIL one-word verdict
+- ``result``               PASS / LOPSIDED / CROSSREADS / FAIL one-word verdict
 - ``notes``                operator comment entered after the trial
 
 After every trial the operator is asked whether to keep that row -- press
@@ -89,13 +89,14 @@ POWER_LEVELS_MW: List[int] = [30, 175, 316]
 
 # The reader's decision window is 1000 ms, so each trial captures
 # roughly TRIAL_DURATION_S window lines. 5 s gives 5 windows -- enough
-# to comfortably detect a tag that needs to verify in 3 s and still
-# observe a couple of windows of behaviour after that.
+# to observe the cup-slide settle and any after-glow leakage.
 TRIAL_DURATION_S: float = 5.0
 
-# A tag must be attributed within this many seconds for the trial to
-# pass. Matches the product spec: "verification happens within 3 s of
-# the user sliding a tagged cup over the antenna".
+# Timing is no longer part of the PASS/FAIL verdict. This deadline is
+# kept only as the cutoff for the ``scans_in_3s`` column (the per-row
+# work counter): it sums the number of inventory calls each antenna
+# made inside the first VERIFY_DEADLINE_S seconds of the trial, so
+# that column can be compared across trials of different lengths.
 VERIFY_DEADLINE_S: float = 3.0
 
 # Photo thumbnail height (pixels) embedded in the workbook. Row height
@@ -337,10 +338,6 @@ class TrialResult:
         return self.ttv_s is not None
 
     @property
-    def within_deadline(self) -> bool:
-        return self.ttv_s is not None and self.ttv_s <= VERIFY_DEADLINE_S
-
-    @property
     def n_hits_winner(self) -> int:
         if self.winning_antenna is None:
             return 0
@@ -382,22 +379,40 @@ class TrialResult:
         return best
 
     @property
-    def result(self) -> str:
-        """One-word verdict for the summary column:
+    def is_ideal_pair(self) -> bool:
+        """The product-defined ideal: EXACTLY two distinct EPCs, one homed
+        to antenna 0 and the other to antenna 1, with no cross-reads.
+        Anything else (single tag, both tags on the same antenna, more
+        than two tags, any same-EPC leakage) is not the ideal pattern."""
+        if self.cross_reads > 0:
+            return False
+        homes = self.epc_home_antennas
+        if len(homes) != 2:
+            return False
+        return set(homes.values()) == {0, 1}
 
-        - ``PASS``  verified, within 3 s, no cross-reads
-        - ``SLOW``  verified + clean but took longer than 3 s
-        - ``DIRTY`` verified but at least one EPC was attributed to more
-                    than one antenna during the trial (same-tag leakage)
-        - ``FAIL``  never got any attribution
+    @property
+    def result(self) -> str:
+        """One-word verdict for the summary column. Precedence (top wins):
+
+        - ``FAIL``       no EPC was ever attributed to any antenna.
+        - ``CROSSREADS`` at least one EPC was attributed to BOTH antennas
+                         at some point in the trial (same-tag leakage).
+        - ``PASS``       exactly two distinct EPCs, one homed to ant0 and
+                         the other homed to ant1, with no cross-reads.
+        - ``LOPSIDED``   everything else: single-tag trials, two tags
+                         clumped on one antenna, three or more tags in
+                         any distribution -- i.e. not the ideal pattern.
+        Timing is no longer part of the verdict; only the attribution
+        pattern matters.
         """
         if not self.verified:
             return "FAIL"
-        if not self.clean:
-            return "DIRTY"
-        if not self.within_deadline:
-            return "SLOW"
-        return "PASS"
+        if self.cross_reads > 0:
+            return "CROSSREADS"
+        if self.is_ideal_pair:
+            return "PASS"
+        return "LOPSIDED"
 
 
 # ─────────────────────────── workbook I/O ───────────────────────────
@@ -461,17 +476,27 @@ GRID_COLOR      = "E5E7EB"
 
 # Soft pastel pill colours for the verdict column. Light fill + a
 # saturated dark text colour keeps them legible at small sizes.
+# Legacy verdict names (SLOW / DIRTY) are kept in the maps so historic
+# rows written by older versions of this script still render with the
+# correct colour. New trials only ever produce PASS / LOPSIDED /
+# CROSSREADS / FAIL.
 RESULT_FILLS = {
-    "PASS":  PatternFill(start_color="D1FAE5", end_color="D1FAE5", fill_type="solid"),
-    "SLOW":  PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid"),
-    "DIRTY": PatternFill(start_color="FFEDD5", end_color="FFEDD5", fill_type="solid"),
-    "FAIL":  PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid"),
+    "PASS":       PatternFill(start_color="D1FAE5", end_color="D1FAE5", fill_type="solid"),
+    "LOPSIDED":   PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid"),
+    "CROSSREADS": PatternFill(start_color="FFEDD5", end_color="FFEDD5", fill_type="solid"),
+    "FAIL":       PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid"),
+    # legacy
+    "SLOW":       PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid"),
+    "DIRTY":      PatternFill(start_color="FFEDD5", end_color="FFEDD5", fill_type="solid"),
 }
 RESULT_FONTS = {
-    "PASS":  Font(name=FONT_FAMILY, bold=True, color="065F46", size=11),
-    "SLOW":  Font(name=FONT_FAMILY, bold=True, color="92400E", size=11),
-    "DIRTY": Font(name=FONT_FAMILY, bold=True, color="9A3412", size=11),
-    "FAIL":  Font(name=FONT_FAMILY, bold=True, color="991B1B", size=11),
+    "PASS":       Font(name=FONT_FAMILY, bold=True, color="065F46", size=11),
+    "LOPSIDED":   Font(name=FONT_FAMILY, bold=True, color="92400E", size=11),
+    "CROSSREADS": Font(name=FONT_FAMILY, bold=True, color="9A3412", size=11),
+    "FAIL":       Font(name=FONT_FAMILY, bold=True, color="991B1B", size=11),
+    # legacy
+    "SLOW":       Font(name=FONT_FAMILY, bold=True, color="92400E", size=11),
+    "DIRTY":      Font(name=FONT_FAMILY, bold=True, color="9A3412", size=11),
 }
 
 
@@ -863,8 +888,9 @@ def main() -> int:
     print(f"=== Beer-pour RFID verification test session {session_id} ===")
     print(f"Results : {RESULTS_XLSX}")
     print(f"Reader  : {RFID_BINARY.name}")
-    print(f"Trial   : {TRIAL_DURATION_S:.1f} s  (verify deadline: "
-          f"{VERIFY_DEADLINE_S:.1f} s)")
+    print(f"Trial   : {TRIAL_DURATION_S:.1f} s")
+    print(f"Verdict : PASS = exactly 2 EPCs, one per antenna, no cross-reads")
+    print(f"          LOPSIDED / CROSSREADS / FAIL otherwise")
 
     scenario_idx = _pick("scenarios", SCENARIOS)
     power_idx    = _pick("power levels (mW)", [str(p) for p in POWER_LEVELS_MW])

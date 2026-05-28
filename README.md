@@ -27,7 +27,7 @@ Each trial is **one row** in `beer-pour-results.xlsx` with these columns (in ord
 | `best_rssi_winner_dbm`       | Strongest (closest-to-zero) RSSI on the winning antenna across the trial.           |
 | `detected_epcs`              | Every distinct EPC seen during the trial, regardless of antenna.                    |
 | `tag_photo`                  | Embedded thumbnail of `images/tags/<tag>.png`.                                      |
-| `result`                     | One-word verdict (colour-coded): **PASS** (verified ≤3 s, clean) / **SLOW** (verified + clean, >3 s) / **DIRTY** (same EPC seen on both antennas) / **FAIL** (no attribution). |
+| `result`                     | One-word verdict (colour-coded): **PASS** (exactly 2 EPCs, one per antenna, no cross-reads) / **LOPSIDED** (anything not ideal: 1 tag only, both tags on the same antenna, 3+ tags, etc.) / **CROSSREADS** (same EPC seen on both antennas) / **FAIL** (no attribution at all). |
 | `notes`                      | Free-text comment you typed at the post-trial prompt.                               |
 
 ## Test axes
@@ -126,7 +126,9 @@ Sample session:
 === Beer-pour RFID verification test session 20260527-143200 ===
 Results : /home/stratela/Test-2/beer-pour-results.xlsx
 Reader  : rfid_gc_live
-Trial   : 5.0 s  (verify deadline: 3.0 s)
+Trial   : 5.0 s
+Verdict : PASS = exactly 2 EPCs, one per antenna, no cross-reads
+          LOPSIDED / CROSSREADS / FAIL otherwise
 
 Available scenarios:
   1. drip_tray_empty_cup_empty
@@ -169,12 +171,16 @@ the harness prints a single-line verdict.
 
 ### Verdict short-codes
 
-| Verdict   | Meaning |
-|-----------|---------|
-| **PASS**  | `verified == yes`, `within_3s == yes`, `cross_reads == 0`. The happy path. |
-| **SLOW**  | Verified + clean, but `ttv_s > 3.0`. The arbitrator got it right but missed the 3-second deadline (e.g. the operator hadn't actually placed the cup yet). |
-| **DIRTY** | Verified, but at least one EPC was attributed to both antennas during the trial (same tag leaking). Two different tags on two different antennas is **not** DIRTY. |
-| **FAIL**  | No attribution at all in the trial. |
+Verdicts are evaluated in this precedence (top wins):
+
+| Verdict        | Colour | Meaning |
+|----------------|--------|---------|
+| **FAIL**       | red    | No EPC was ever attributed to any antenna in the trial. |
+| **CROSSREADS** | orange | At least one EPC was attributed to both antennas at some point in the trial (same-tag leakage). Overrides LOPSIDED if both apply. |
+| **PASS**       | green  | **Ideal pattern only**: exactly two distinct EPCs, one homed to ant0 and the other to ant1, with no cross-reads. |
+| **LOPSIDED**   | yellow | Anything that isn't the ideal pattern but isn't FAIL/CROSSREADS either: single-tag trials, both tags clumped on the same antenna, three or more tags in any distribution. |
+
+Timing is no longer part of the verdict. The first-attribution time is still measured (and `scans_in_3s` still captures work done in the first 3 s), but a slow-but-otherwise-ideal trial is still PASS.
 
 Press `'q'` (or Ctrl-C) at the menu to end the session.
 
@@ -195,8 +201,8 @@ and appended to thereafter — every run writes new rows into the single
 `Trials` sheet. The header row is dark-navy / white, frozen so it stays
 visible while scrolling, and rows are striped white/off-white for
 readability. The `result` verdict is colour-coded as a soft pill (green
-PASS / amber SLOW / orange DIRTY / red FAIL), and the `tag_photo`
-column holds an embedded thumbnail of the tag used.
+PASS / yellow LOPSIDED / orange CROSSREADS / red FAIL), and the
+`tag_photo` column holds an embedded thumbnail of the tag used.
 
 If a newer version of this script changes the column layout, the
 existing file is renamed to `beer-pour-results_archive_<timestamp>.xlsx`
@@ -210,7 +216,7 @@ top of this document for the full column list and definitions.
 
 ## Tweaks
 
-- Trial duration & verify deadline: `TRIAL_DURATION_S` / `VERIFY_DEADLINE_S` in `beer_pour_logger.py`.
+- Trial duration: `TRIAL_DURATION_S` in `beer_pour_logger.py`. `VERIFY_DEADLINE_S` only affects the `scans_in_3s` column — it does **not** gate the verdict.
 - Add a scenario: append it to `SCENARIOS`, drop a matching `images/scenarios/<name>.png` (optional).
 - Add a power level: append to `POWER_LEVELS_MW`. The C binary accepts anything in `1..316` mW.
 - Add a tag type: drop `images/tags/<name>.png`. The next session will list it in the tag menu.
@@ -222,5 +228,6 @@ top of this document for the full column list and definitions.
 - **`ModuleNotFoundError: openpyxl`** — `sudo apt install -y python3-openpyxl python3-pil` (or `pip3 install --break-system-packages -r requirements.txt`).
 - **`Could not connect (code …)`** — check USB, then `sudo chmod 666 /dev/ttyACM0` (or add yourself to `dialout` group and re-login).
 - **All trials show `FAIL`** — make sure you're sliding the cup quickly after the `GO!` prompt; the trial clock starts when `[GC] Ready` appears.
-- **Lots of `DIRTY` results** — the same EPC is showing up on both antennas (`cross_read_epcs` column tells you which). Likely cause: one tag sitting between antennas, or `GC_RSSI_MARGIN_DB10` in `rfid_gc_live.c` is too low. If you deliberately have one tag per antenna and each EPC only ever appears on its home antenna, you should see **PASS**, not DIRTY.
+- **Lots of `CROSSREADS` results** — the same EPC is showing up on both antennas during the trial. Likely cause: one tag sitting near the boundary between antennas, or `GC_RSSI_MARGIN_DB10` in `rfid_gc_live.c` is too low. If you deliberately have one tag per antenna and each EPC only ever appears on its home antenna, you should see **PASS**, not CROSSREADS.
+- **Lots of `LOPSIDED` results** — the trial saw something but it wasn't the ideal "one tag per antenna" pattern. Either only one cup was actually detected, both cups ended up over the same antenna (often at high TX power where leakage dominates), or three-plus tags appeared. Recheck cup placement and TX power.
 - **`beer-pour-results.xlsx` write fails** — Excel locks the file when it's open. Close it and retry the trial.
